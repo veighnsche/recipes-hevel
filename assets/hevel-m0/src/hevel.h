@@ -133,6 +133,10 @@ int portal_service_main(void);
 int eis_initialize(void);
 void eis_finalize(void);
 
+int inject_initialize(const char *display_name);
+void inject_finalize(void);
+int inject_cli_main(int argc, char **argv);
+
 extern const int timerms;
 
 #endif
