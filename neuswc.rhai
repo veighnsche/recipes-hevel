@@ -1,9 +1,10 @@
 let deps = ["rocky-hevel-bootstrap", "bmake", "neuwld"];
+let patch_file = join_path(RECIPE_DIR, "assets/neuswc-injection/injection.patch");
 
 let ctx = #{
     bin_path: "/usr/local/bin/swc-launch",
     name: "neuswc",
-    patch_file: "/home/vince/.local/share/recipe/recipes/assets/neuswc-m1a/injection.patch",
+    patch_file: patch_file,
     repo_url: "https://git.sr.ht/~shrub900/neuswc",
     src_dir: "/tmp/.tmpGjaxJt/neuswc-d7a9eda640d4b4d96f6158266099d3c3fe8e5673",
     stage_dir: "/tmp/.tmpGjaxJt/stage",
