@@ -16,6 +16,7 @@ struct portal_state portal = {0};
 int
 portal_initialize(void)
 {
+  inputcapture_initialize();
   wl_list_init(&portal.requests);
   wl_list_init(&portal.remotedesktop_sessions);
   portal.bus = NULL;
@@ -30,6 +31,7 @@ void
 portal_finalize(void)
 {
   remotedesktop_finalize();
+  inputcapture_finalize();
   if (portal.bus && portal.event) sd_bus_detach_event(portal.bus);
   if (portal.bus) {
     sd_bus_unref(portal.bus);

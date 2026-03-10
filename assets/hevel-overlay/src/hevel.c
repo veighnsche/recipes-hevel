@@ -142,9 +142,11 @@ main(int argc, char **argv)
   wl_list_init(&compositor.screens);
 
   compositor.current_screen = NULL;
+  inputcapture_initialize();
   compositor.display = wl_display_create();
   if (!compositor.display) {
     fprintf(stderr, "cannot create display\n");
+    inputcapture_finalize();
     return 1;
   }
 
@@ -153,6 +155,7 @@ main(int argc, char **argv)
 
   if (!swc_initialize(compositor.display, evloop, &manager)) {
     fprintf(stderr, "cannot initialize swc\n");
+    inputcapture_finalize();
     return 1;
   }
 
@@ -191,6 +194,7 @@ main(int argc, char **argv)
   wl_display_run(compositor.display);
 
   eis_finalize();
+  inputcapture_finalize();
   inject_finalize();
   swc_finalize();
   wl_display_destroy(compositor.display);

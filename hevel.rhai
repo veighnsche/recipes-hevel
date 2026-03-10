@@ -6,7 +6,7 @@ let ctx = #{
     name: "hevel",
     overlay_dir: overlay_dir,
     repo_url: "https://git.sr.ht/~dlm/hevel",
-    src_dir: "/tmp/.tmpniSeDk/hevel-f5f689cfe2d0f398ad227af1fba2d960cee000c6",
+    src_dir: "/tmp/.tmps5WjP4/hevel-f5f689cfe2d0f398ad227af1fba2d960cee000c6",
     version: "f5f689cfe2d0f398ad227af1fba2d960cee000c6",
 };
 
@@ -14,7 +14,7 @@ fn apply_overlay(ctx) {
     let src_overlay = join_path(ctx.overlay_dir, "src");
 
     write_file(join_path(ctx.src_dir, "Makefile"), read_file(join_path(ctx.overlay_dir, "Makefile")));
-    for file in ["hevel.c", "hevel.h", "eis.c", "inject.c", "approve.c", "portal.c", "inputcapture.c", "remotedesktop.c"] {
+    for file in ["hevel.c", "hevel.h", "window.c", "eis.c", "inject.c", "approve.c", "portal.c", "inputcapture.c", "remotedesktop.c"] {
         write_file(join_path(join_path(ctx.src_dir, "src"), file), read_file(join_path(src_overlay, file)));
     }
 
