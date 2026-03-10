@@ -515,6 +515,10 @@ inject_handle_client(int client_fd)
     }
 
     r = eis_close_session(session_id);
+    if (r == -ENOENT) {
+      inject_send_reply(client_fd, "ok\n");
+      return;
+    }
     if (r < 0) {
       dprintf(client_fd, "error cannot close EIS session: %s\n", strerror(-r));
       return;
