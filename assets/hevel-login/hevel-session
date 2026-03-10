@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-}" ]; then
+    echo "hevel-session: XDG_RUNTIME_DIR is not set" >&2
+    exit 1
+fi
+
+export XDG_CURRENT_DESKTOP=hevel
+export XDG_SESSION_DESKTOP=hevel
+export XDG_SESSION_TYPE=wayland
+exec swc-launch /usr/local/bin/hevel

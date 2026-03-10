@@ -1,0 +1,6 @@
+[terminal]
+vt = 1
+
+[default_session]
+command = "/usr/local/bin/tuigreet --time --asterisks --user-menu --remember --remember-user-session --cmd /usr/local/bin/hevel-session"
+user = "greeter"

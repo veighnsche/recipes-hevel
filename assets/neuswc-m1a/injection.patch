@@ -1,0 +1,142 @@
+--- a/libswc/keyboard.c
++++ b/libswc/keyboard.c
+@@ -28,6 +28,7 @@
+ #include "keyboard.h"
+ #include "compositor.h"
+ #include "internal.h"
++#include "seat.h"
+ #include "surface.h"
+ #include "swc.h"
+ #include "util.h"
+@@ -43,6 +44,20 @@
+ 
+ static const int repeat_delay = 500, repeat_rate = 40;
+ 
++EXPORT bool
++swc_keyboard_inject_key(uint32_t time, uint32_t key, uint32_t state)
++{
++	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
++
++	if (!swc.active || !keyboard) {
++		return false;
++	}
++
++	keyboard_handle_key(keyboard, time, key, state);
++	return true;
++}
++
++
+ static void
+ enter(struct input_focus_handler *handler,
+       struct wl_list *resources,
+--- a/libswc/pointer.c
++++ b/libswc/pointer.c
+@@ -117,6 +117,72 @@
+ 	pointer->client_axis_source = -1;
+ }
+ 
++EXPORT bool
++swc_pointer_inject_relative_motion(uint32_t time, int32_t dx, int32_t dy)
++{
++	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
++
++	if (!swc.active || !pointer) {
++		return false;
++	}
++
++	pointer_handle_relative_motion(pointer, time, dx, dy);
++	return true;
++}
++
++EXPORT bool
++swc_pointer_inject_absolute_motion(uint32_t time, int32_t x, int32_t y)
++{
++	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
++
++	if (!swc.active || !pointer) {
++		return false;
++	}
++
++	pointer_handle_absolute_motion(pointer, time, x, y);
++	return true;
++}
++
++EXPORT bool
++swc_pointer_inject_button(uint32_t time, uint32_t button, uint32_t state)
++{
++	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
++
++	if (!swc.active || !pointer) {
++		return false;
++	}
++
++	pointer_handle_button(pointer, time, button, state);
++	return true;
++}
++
++EXPORT bool
++swc_pointer_inject_axis(uint32_t time, uint32_t axis, uint32_t source,
++                        int32_t value, int32_t value120)
++{
++	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
++
++	if (!swc.active || !pointer) {
++		return false;
++	}
++
++	pointer_handle_axis(pointer, time, axis, source, value, value120);
++	return true;
++}
++
++EXPORT bool
++swc_pointer_inject_frame(void)
++{
++	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
++
++	if (!swc.active || !pointer) {
++		return false;
++	}
++
++	pointer_handle_frame(pointer);
++	return true;
++}
++
+ static void
+ enter(struct input_focus_handler *handler, struct wl_list *resources,
+       struct compositor_view *view)
+--- a/libswc/swc.h
++++ b/libswc/swc.h
+@@ -68,6 +68,33 @@
+ void
+ swc_pointer_send_axis(uint32_t time, uint32_t axis, int32_t value120);
+ 
++/**
++ * Inject a keyboard event into the compositor seat.
++ *
++ * key uses Linux evdev codes. state uses wl_keyboard key state values.
++ */
++bool
++swc_keyboard_inject_key(uint32_t time, uint32_t key, uint32_t state);
++
++/**
++ * Inject pointer events into the compositor seat.
++ *
++ * Coordinates, deltas, and axis values are raw wl_fixed_t (24.8) values
++ * exposed as int32_t to avoid a wayland header dependency in callers.
++ * axis and source use wl_pointer enum values.
++ */
++bool
++swc_pointer_inject_relative_motion(uint32_t time, int32_t dx, int32_t dy);
++bool
++swc_pointer_inject_absolute_motion(uint32_t time, int32_t x, int32_t y);
++bool
++swc_pointer_inject_button(uint32_t time, uint32_t button, uint32_t state);
++bool
++swc_pointer_inject_axis(uint32_t time, uint32_t axis, uint32_t source,
++                        int32_t value, int32_t value120);
++bool
++swc_pointer_inject_frame(void);
++
+ /* Cursor control (compositor-internal cursor) */
+ enum swc_cursor_kind {
+ 	SWC_CURSOR_DEFAULT = 0,

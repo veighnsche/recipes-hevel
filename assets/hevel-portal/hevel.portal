@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.hevel
+Interfaces=org.freedesktop.impl.portal.InputCapture;org.freedesktop.impl.portal.RemoteDesktop;
+UseIn=hevel;
