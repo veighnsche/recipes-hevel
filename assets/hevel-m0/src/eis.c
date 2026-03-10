@@ -101,6 +101,14 @@ eis_request_free(struct hevel_eis_request *request)
   free(request);
 }
 
+static bool
+eis_request_matches_session(const struct hevel_eis_request *request,
+                            const char *session_id)
+{
+  if (!request || !session_id || session_id[0] == '\0') return false;
+  return strcmp(request->session_id, session_id) == 0;
+}
+
 static void
 eis_release_device(struct eis_device **device)
 {
@@ -791,4 +799,34 @@ eis_open_client_fd(const char *session_id, uint32_t capabilities,
 
   wl_list_insert(eis_state.requests.prev, &request->link);
   return fd;
+}
+
+int
+eis_close_session(const char *session_id)
+{
+  struct hevel_eis_client *client_state, *client_tmp;
+  struct hevel_eis_request *request, *request_tmp;
+  bool found = false;
+
+  if (!session_id || session_id[0] == '\0') return -EINVAL;
+  if (!eis_state.requests.next || !eis_state.clients.next) return -ENOTCONN;
+
+  wl_list_for_each_safe(request, request_tmp, &eis_state.requests, link)
+  {
+    if (!eis_request_matches_session(request, session_id)) continue;
+    wl_list_remove(&request->link);
+    wl_list_init(&request->link);
+    eis_request_free(request);
+    found = true;
+  }
+
+  wl_list_for_each_safe(client_state, client_tmp, &eis_state.clients, link)
+  {
+    if (!eis_request_matches_session(client_state->request, session_id)) continue;
+    if (client_state->client) eis_client_disconnect(client_state->client);
+    eis_cleanup_client(client_state);
+    found = true;
+  }
+
+  return found ? 0 : -ENOENT;
 }

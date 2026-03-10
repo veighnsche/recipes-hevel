@@ -240,6 +240,65 @@ inject_execute_command(char *buffer, char *error, size_t error_size)
 }
 
 static void
+inject_parse_eis_open(char *buffer, char *session_id, size_t session_id_size,
+                      uint32_t *capabilities, char *name, size_t name_size,
+                      char *error, size_t error_size)
+{
+  char *argv[4] = {0};
+  char *save = NULL;
+  int argc = 0;
+
+  for (char *token = strtok_r(buffer, " \t\r\n", &save);
+       token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       token = strtok_r(NULL, " \t\r\n", &save)) {
+    argv[argc++] = token;
+  }
+
+  if (argc == 1) {
+    session_id[0] = '\0';
+    *capabilities = 0;
+    snprintf(name, name_size, "%s", "hevel-debug");
+    error[0] = '\0';
+    return;
+  }
+
+  if (argc != 4 || inject_parse_u32(argv[2], capabilities) < 0 ||
+      snprintf(session_id, session_id_size, "%s", argv[1]) >=
+          (int)session_id_size ||
+      snprintf(name, name_size, "%s", argv[3]) >= (int)name_size) {
+    snprintf(error, error_size,
+             "usage: eis-open [<session-id> <capabilities> <name>]");
+    return;
+  }
+
+  error[0] = '\0';
+}
+
+static void
+inject_parse_eis_close(char *buffer, char *session_id, size_t session_id_size,
+                       char *error, size_t error_size)
+{
+  char *argv[3] = {0};
+  char *save = NULL;
+  int argc = 0;
+
+  for (char *token = strtok_r(buffer, " \t\r\n", &save);
+       token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       token = strtok_r(NULL, " \t\r\n", &save)) {
+    argv[argc++] = token;
+  }
+
+  if (argc != 2 ||
+      snprintf(session_id, session_id_size, "%s", argv[1]) >=
+          (int)session_id_size) {
+    snprintf(error, error_size, "usage: eis-close <session-id>");
+    return;
+  }
+
+  error[0] = '\0';
+}
+
+static void
 inject_handle_client(int client_fd)
 {
   char buffer[256];
@@ -261,7 +320,21 @@ inject_handle_client(int client_fd)
   if (strncmp(buffer, "eis-open", 8) == 0 &&
       (buffer[8] == '\0' || buffer[8] == '\n' || buffer[8] == ' ' ||
        buffer[8] == '\t' || buffer[8] == '\r')) {
-    int eis_fd = eis_open_client_fd(NULL, 0, "hevel-debug");
+    char session_id[128];
+    char name[64];
+    uint32_t capabilities = 0;
+    int eis_fd;
+
+    inject_parse_eis_open(buffer, session_id, sizeof(session_id), &capabilities,
+                          name, sizeof(name), error, sizeof(error));
+    if (error[0] != '\0') {
+      dprintf(client_fd, "error %s\n", error);
+      return;
+    }
+
+    eis_fd =
+        eis_open_client_fd(session_id[0] != '\0' ? session_id : NULL,
+                           capabilities, name);
 
     if (eis_fd < 0) {
       dprintf(client_fd, "error cannot open EIS client fd: %s\n",
@@ -272,6 +345,29 @@ inject_handle_client(int client_fd)
     if (inject_send_fd(client_fd, eis_fd, "ok\n") < 0)
       inject_send_reply(client_fd, "error cannot send fd\n");
     close(eis_fd);
+    return;
+  }
+
+  if (strncmp(buffer, "eis-close", 9) == 0 &&
+      (buffer[9] == '\0' || buffer[9] == '\n' || buffer[9] == ' ' ||
+       buffer[9] == '\t' || buffer[9] == '\r')) {
+    char session_id[128];
+    int r;
+
+    inject_parse_eis_close(buffer, session_id, sizeof(session_id), error,
+                           sizeof(error));
+    if (error[0] != '\0') {
+      dprintf(client_fd, "error %s\n", error);
+      return;
+    }
+
+    r = eis_close_session(session_id);
+    if (r < 0) {
+      dprintf(client_fd, "error cannot close EIS session: %s\n", strerror(-r));
+      return;
+    }
+
+    inject_send_reply(client_fd, "ok\n");
     return;
   }
 
@@ -604,8 +700,10 @@ eis_cli_process_events(struct hevel_ei_client *client)
 }
 
 static int
-eis_cli_request_fd(const char *socket_path)
+inject_request_eis_fd(const char *socket_path, const char *session_id,
+                      uint32_t capabilities, const char *name)
 {
+  char command[256];
   char reply[64] = {0};
   struct msghdr msg = {0};
   struct iovec iov = {.iov_base = reply, .iov_len = sizeof(reply) - 1};
@@ -621,7 +719,18 @@ eis_cli_request_fd(const char *socket_path)
     return -1;
   }
 
-  if (inject_send_reply(socket_fd, "eis-open\n") < 0) {
+  if (session_id && session_id[0] != '\0' && name && name[0] != '\0') {
+    if (snprintf(command, sizeof(command), "eis-open %s %u %s\n", session_id,
+                 capabilities, name) >= (int)sizeof(command)) {
+      fprintf(stderr, "hevel: EIS request command too long\n");
+      close(socket_fd);
+      return -1;
+    }
+  } else {
+    snprintf(command, sizeof(command), "eis-open\n");
+  }
+
+  if (inject_send_reply(socket_fd, command) < 0) {
     perror("hevel: write");
     close(socket_fd);
     return -1;
@@ -663,10 +772,54 @@ eis_cli_request_fd(const char *socket_path)
   return fd;
 }
 
+int
+inject_open_eis_fd(const char *display_name, const char *session_id,
+                   uint32_t capabilities, const char *name)
+{
+  char socket_path[256];
+  const char *display = display_name && display_name[0] != '\0'
+                            ? display_name
+                            : getenv("WAYLAND_DISPLAY");
+
+  if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path for EIS handoff\n");
+    return -1;
+  }
+
+  return inject_request_eis_fd(socket_path, session_id, capabilities, name);
+}
+
+int
+inject_close_eis_session(const char *display_name, const char *session_id)
+{
+  char socket_path[256];
+  char command[256];
+  const char *display = display_name && display_name[0] != '\0'
+                            ? display_name
+                            : getenv("WAYLAND_DISPLAY");
+
+  if (!session_id || session_id[0] == '\0') return -EINVAL;
+
+  if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path for EIS teardown\n");
+    return -1;
+  }
+
+  if (snprintf(command, sizeof(command), "eis-close %s\n", session_id) >=
+      (int)sizeof(command)) {
+    fprintf(stderr, "hevel: EIS close command too long\n");
+    return -1;
+  }
+
+  return inject_send_command(socket_path, command) == 0 ? 0 : -1;
+}
+
 static int
 eis_cli_connect(struct hevel_ei_client *client, const char *socket_path)
 {
-  int fd = eis_cli_request_fd(socket_path);
+  int fd = inject_request_eis_fd(socket_path, NULL, 0, NULL);
   int r;
 
   if (fd < 0) return -1;

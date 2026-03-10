@@ -19,6 +19,38 @@ bool focus_center = FOCUS_CENTER;
 #include "remotedesktop.c"
 #include "portal.c"
 
+#include <errno.h>
+#include <sys/wait.h>
+
+static void
+update_activation_environment(void)
+{
+  pid_t pid;
+  int status;
+
+  pid = fork();
+  if (pid < 0) {
+    perror("hevel: fork");
+    return;
+  }
+  if (pid == 0) {
+    execlp("dbus-update-activation-environment",
+           "dbus-update-activation-environment", "--systemd",
+           "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP",
+           "XDG_SESSION_DESKTOP", "XDG_SESSION_TYPE", NULL);
+    _exit(127);
+  }
+
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno == EINTR) continue;
+    perror("hevel: waitpid");
+    return;
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    fprintf(stderr, "hevel: dbus activation environment update failed\n");
+}
+
 static void
 maybe_enable_nein_cursor_theme(void)
 {
@@ -143,6 +175,7 @@ main(int argc, char **argv)
 
   printf("%s\n", sock);
   setenv("WAYLAND_DISPLAY", sock, 1);
+  update_activation_environment();
 
   if (inject_initialize(sock) < 0)
     fprintf(stderr, "hevel: continuing without local injection hook\n");

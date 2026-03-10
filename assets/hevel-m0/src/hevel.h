@@ -117,6 +117,8 @@ struct eis;
 struct eis_client;
 struct eis_device;
 struct eis_seat;
+struct sd_bus;
+struct sd_bus_slot;
 
 struct hevel_eis_request {
   struct wl_list link;
@@ -141,7 +143,40 @@ struct hevel_eis_client {
   bool pointer_abs_active;
 };
 
+enum hevel_rd_session_state {
+  HEVEL_RD_CREATED,
+  HEVEL_RD_SELECTED,
+  HEVEL_RD_STARTED,
+  HEVEL_RD_CONNECTED,
+  HEVEL_RD_CLOSED,
+};
+
+struct hevel_portal_request {
+  struct wl_list link;
+  char handle[256];
+  char session_handle[256];
+  char app_id[128];
+  struct sd_bus_slot *slot;
+};
+
+struct hevel_rd_session {
+  struct wl_list link;
+  char session_handle[256];
+  char session_id[128];
+  char app_id[128];
+  char parent_window[256];
+  uint32_t selected_device_types;
+  bool approved;
+  bool eis_fd_issued;
+  enum hevel_rd_session_state state;
+  struct sd_bus_slot *slot;
+};
+
 struct portal_state {
+  struct sd_bus *bus;
+  struct wl_list requests;
+  struct wl_list remotedesktop_sessions;
+  uint32_t next_session_id;
   bool available;
 };
 extern struct portal_state portal;
@@ -160,16 +195,21 @@ extern struct eis_state eis_state;
 int portal_initialize(void);
 void portal_finalize(void);
 int portal_service_main(void);
+void remotedesktop_finalize(void);
 
 int eis_initialize(void);
 void eis_finalize(void);
 int eis_open_client_fd(const char *session_id, uint32_t capabilities,
                        const char *name);
+int eis_close_session(const char *session_id);
 int eis_cli_main(int argc, char **argv);
 
 int inject_initialize(const char *display_name);
 void inject_finalize(void);
 int inject_cli_main(int argc, char **argv);
+int inject_open_eis_fd(const char *display_name, const char *session_id,
+                       uint32_t capabilities, const char *name);
+int inject_close_eis_session(const char *display_name, const char *session_id);
 
 extern const int timerms;
 
