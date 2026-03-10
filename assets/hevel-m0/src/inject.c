@@ -10,9 +10,24 @@
 #include <sys/un.h>
 #include <time.h>
 
+#include <systemd/sd-bus.h>
+
+#ifndef SO_PEERCRED
+#define SO_PEERCRED 17
+#endif
+
 static int inject_fd = -1;
 static struct wl_event_source *inject_source = NULL;
 static char inject_socket_path[256] = {0};
+static sd_bus *inject_bus = NULL;
+static const char *inject_portal_bus_name =
+    "org.freedesktop.impl.portal.desktop.hevel";
+
+struct inject_peer_cred {
+  pid_t pid;
+  uid_t uid;
+  gid_t gid;
+};
 
 static uint32_t
 inject_now_ms(void)
@@ -134,6 +149,91 @@ inject_send_fd(int socket_fd, int send_fd, const char *reply)
 }
 
 static int
+inject_open_user_bus(void)
+{
+  int r;
+
+  if (inject_bus) return 0;
+
+  r = sd_bus_default_user(&inject_bus);
+  if (r < 0) {
+    fprintf(stderr, "hevel: cannot open user bus for socket authorization: %s\n",
+            strerror(-r));
+    inject_bus = NULL;
+  }
+
+  return r;
+}
+
+static int
+inject_get_portal_owner_pid(pid_t *pid)
+{
+  sd_bus_creds *creds = NULL;
+  int r;
+
+  if (!pid) return -EINVAL;
+
+  r = inject_open_user_bus();
+  if (r < 0) return r;
+
+  r = sd_bus_get_name_creds(inject_bus, inject_portal_bus_name,
+                            SD_BUS_CREDS_PID, &creds);
+  if (r < 0) return r;
+
+  r = sd_bus_creds_get_pid(creds, pid);
+  sd_bus_creds_unref(creds);
+  return r;
+}
+
+static int
+inject_get_peer_pid(int fd, pid_t *pid)
+{
+  struct inject_peer_cred cred = {0};
+  socklen_t length = sizeof(cred);
+
+  if (!pid) return -EINVAL;
+
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &length) < 0)
+    return -errno;
+  if (length < sizeof(cred)) return -EIO;
+
+  *pid = cred.pid;
+  return 0;
+}
+
+static bool
+inject_authorize_portal_peer(int fd, const char *command)
+{
+  pid_t peer_pid = 0;
+  pid_t owner_pid = 0;
+  int r;
+
+  r = inject_get_peer_pid(fd, &peer_pid);
+  if (r < 0) {
+    fprintf(stderr, "hevel: cannot determine peer pid for %s: %s\n", command,
+            strerror(-r));
+    return false;
+  }
+
+  r = inject_get_portal_owner_pid(&owner_pid);
+  if (r < 0) {
+    fprintf(stderr, "hevel: cannot resolve portal owner pid for %s: %s\n",
+            command, strerror(-r));
+    return false;
+  }
+
+  if (peer_pid != owner_pid) {
+    fprintf(stderr,
+            "hevel: rejecting unauthorized socket command %s from pid %ld "
+            "(portal pid %ld)\n",
+            command, (long)peer_pid, (long)owner_pid);
+    return false;
+  }
+
+  return true;
+}
+
+static int
 inject_connect_socket(const char *socket_path)
 {
   struct sockaddr_un addr = {0};
@@ -161,13 +261,9 @@ inject_connect_socket(const char *socket_path)
 static int
 inject_execute_command(char *buffer, char *error, size_t error_size)
 {
-  char *argv[8] = {0};
+  char *argv[2] = {0};
   char *save = NULL;
   int argc = 0;
-  uint32_t time = inject_now_ms();
-  uint32_t key, button, state, axis, source;
-  int32_t dx, dy, x, y, value, value120;
-  bool ok = false;
 
   for (char *token = strtok_r(buffer, " \t\r\n", &save);
        token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
@@ -182,61 +278,67 @@ inject_execute_command(char *buffer, char *error, size_t error_size)
 
   if (strcmp(argv[0], "ping") == 0) return 0;
 
-  if (strcmp(argv[0], "key") == 0) {
-    if (argc != 3 || inject_parse_u32(argv[1], &key) < 0 ||
-        inject_parse_u32(argv[2], &state) < 0) {
-      snprintf(error, error_size, "usage: key <evdev-key> <state>");
-      return -1;
-    }
-    ok = swc_keyboard_inject_key(time, key, state);
-  } else if (strcmp(argv[0], "motion") == 0) {
-    if (argc != 3 || inject_parse_i32(argv[1], &dx) < 0 ||
-        inject_parse_i32(argv[2], &dy) < 0) {
-      snprintf(error, error_size, "usage: motion <dx> <dy>");
-      return -1;
-    }
-    ok = swc_pointer_inject_relative_motion(time, dx, dy);
-  } else if (strcmp(argv[0], "absolute") == 0) {
-    if (argc != 3 || inject_parse_i32(argv[1], &x) < 0 ||
-        inject_parse_i32(argv[2], &y) < 0) {
-      snprintf(error, error_size, "usage: absolute <x> <y>");
-      return -1;
-    }
-    ok = swc_pointer_inject_absolute_motion(time, x, y);
-  } else if (strcmp(argv[0], "button") == 0) {
-    if (argc != 3 || inject_parse_u32(argv[1], &button) < 0 ||
-        inject_parse_u32(argv[2], &state) < 0) {
-      snprintf(error, error_size, "usage: button <button> <state>");
-      return -1;
-    }
-    ok = swc_pointer_inject_button(time, button, state);
-  } else if (strcmp(argv[0], "axis") == 0) {
-    if (argc != 5 || inject_parse_u32(argv[1], &axis) < 0 ||
-        inject_parse_u32(argv[2], &source) < 0 ||
-        inject_parse_i32(argv[3], &value) < 0 ||
-        inject_parse_i32(argv[4], &value120) < 0) {
-      snprintf(error, error_size,
-               "usage: axis <axis> <source> <value> <value120>");
-      return -1;
-    }
-    ok = swc_pointer_inject_axis(time, axis, source, value, value120);
-  } else if (strcmp(argv[0], "frame") == 0) {
-    if (argc != 1) {
-      snprintf(error, error_size, "usage: frame");
-      return -1;
-    }
-    ok = swc_pointer_inject_frame();
-  } else {
-    snprintf(error, error_size, "unknown command");
-    return -1;
+  snprintf(error, error_size,
+           "raw injection commands are disabled; use the portal path");
+  return -1;
+}
+
+static void
+inject_parse_spawn_prepare(char *buffer, uint32_t *width, uint32_t *height,
+                           char *error, size_t error_size)
+{
+  char *argv[4] = {0};
+  char *save = NULL;
+  int argc = 0;
+
+  for (char *token = strtok_r(buffer, " \t\r\n", &save);
+       token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       token = strtok_r(NULL, " \t\r\n", &save)) {
+    argv[argc++] = token;
   }
 
-  if (!ok) {
-    snprintf(error, error_size, "hevel input injection unavailable");
-    return -1;
+  if (argc != 3 || inject_parse_u32(argv[1], width) < 0 ||
+      inject_parse_u32(argv[2], height) < 0) {
+    snprintf(error, error_size, "usage: spawn-prepare <width> <height>");
+    return;
   }
+
+  error[0] = '\0';
+}
+
+static int
+inject_prepare_spawn(uint32_t width, uint32_t height)
+{
+  struct screen *screen = compositor.current_screen;
+
+  if (!screen && !wl_list_empty(&compositor.screens))
+    screen = wl_container_of(compositor.screens.next, screen, link);
+  if (!screen || !screen->swc) return -ENODEV;
+
+  if (width < 320) width = 320;
+  if (height < 160) height = 160;
+  if (width > screen->swc->geometry.width) width = screen->swc->geometry.width;
+  if (height > screen->swc->geometry.height)
+    height = screen->swc->geometry.height;
+
+  input.spawn_pending = true;
+  input.spawn_geometry.width = width;
+  input.spawn_geometry.height = height;
+  input.spawn_geometry.x =
+      screen->swc->geometry.x +
+      ((int32_t)screen->swc->geometry.width - (int32_t)width) / 2;
+  input.spawn_geometry.y =
+      screen->swc->geometry.y +
+      ((int32_t)screen->swc->geometry.height - (int32_t)height) / 2;
 
   return 0;
+}
+
+static void
+inject_cancel_spawn(void)
+{
+  input.spawn_pending = false;
+  memset(&input.spawn_geometry, 0, sizeof(input.spawn_geometry));
 }
 
 static void
@@ -254,20 +356,11 @@ inject_parse_eis_open(char *buffer, char *session_id, size_t session_id_size,
     argv[argc++] = token;
   }
 
-  if (argc == 1) {
-    session_id[0] = '\0';
-    *capabilities = 0;
-    snprintf(name, name_size, "%s", "hevel-debug");
-    error[0] = '\0';
-    return;
-  }
-
   if (argc != 4 || inject_parse_u32(argv[2], capabilities) < 0 ||
       snprintf(session_id, session_id_size, "%s", argv[1]) >=
           (int)session_id_size ||
       snprintf(name, name_size, "%s", argv[3]) >= (int)name_size) {
-    snprintf(error, error_size,
-             "usage: eis-open [<session-id> <capabilities> <name>]");
+    snprintf(error, error_size, "usage: eis-open <session-id> <capabilities> <name>");
     return;
   }
 
@@ -292,6 +385,27 @@ inject_parse_eis_close(char *buffer, char *session_id, size_t session_id_size,
       snprintf(session_id, session_id_size, "%s", argv[1]) >=
           (int)session_id_size) {
     snprintf(error, error_size, "usage: eis-close <session-id>");
+    return;
+  }
+
+  error[0] = '\0';
+}
+
+static void
+inject_parse_spawn_cancel(char *buffer, char *error, size_t error_size)
+{
+  char *argv[3] = {0};
+  char *save = NULL;
+  int argc = 0;
+
+  for (char *token = strtok_r(buffer, " \t\r\n", &save);
+       token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       token = strtok_r(NULL, " \t\r\n", &save)) {
+    argv[argc++] = token;
+  }
+
+  if (argc != 1) {
+    snprintf(error, error_size, "usage: spawn-cancel");
     return;
   }
 
@@ -325,6 +439,11 @@ inject_handle_client(int client_fd)
     uint32_t capabilities = 0;
     int eis_fd;
 
+    if (!inject_authorize_portal_peer(client_fd, "eis-open")) {
+      inject_send_reply(client_fd, "error unauthorized command\n");
+      return;
+    }
+
     inject_parse_eis_open(buffer, session_id, sizeof(session_id), &capabilities,
                           name, sizeof(name), error, sizeof(error));
     if (error[0] != '\0') {
@@ -348,11 +467,45 @@ inject_handle_client(int client_fd)
     return;
   }
 
+  if (strncmp(buffer, "spawn-prepare", 13) == 0 &&
+      (buffer[13] == '\0' || buffer[13] == '\n' || buffer[13] == ' ' ||
+       buffer[13] == '\t' || buffer[13] == '\r')) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int r;
+
+    if (!inject_authorize_portal_peer(client_fd, "spawn-prepare")) {
+      inject_send_reply(client_fd, "error unauthorized command\n");
+      return;
+    }
+
+    inject_parse_spawn_prepare(buffer, &width, &height, error,
+                               sizeof(error));
+    if (error[0] != '\0') {
+      dprintf(client_fd, "error %s\n", error);
+      return;
+    }
+
+    r = inject_prepare_spawn(width, height);
+    if (r < 0) {
+      dprintf(client_fd, "error cannot prepare spawn: %s\n", strerror(-r));
+      return;
+    }
+
+    inject_send_reply(client_fd, "ok\n");
+    return;
+  }
+
   if (strncmp(buffer, "eis-close", 9) == 0 &&
       (buffer[9] == '\0' || buffer[9] == '\n' || buffer[9] == ' ' ||
        buffer[9] == '\t' || buffer[9] == '\r')) {
     char session_id[128];
     int r;
+
+    if (!inject_authorize_portal_peer(client_fd, "eis-close")) {
+      inject_send_reply(client_fd, "error unauthorized command\n");
+      return;
+    }
 
     inject_parse_eis_close(buffer, session_id, sizeof(session_id), error,
                            sizeof(error));
@@ -367,6 +520,25 @@ inject_handle_client(int client_fd)
       return;
     }
 
+    inject_send_reply(client_fd, "ok\n");
+    return;
+  }
+
+  if (strncmp(buffer, "spawn-cancel", 12) == 0 &&
+      (buffer[12] == '\0' || buffer[12] == '\n' || buffer[12] == ' ' ||
+       buffer[12] == '\t' || buffer[12] == '\r')) {
+    if (!inject_authorize_portal_peer(client_fd, "spawn-cancel")) {
+      inject_send_reply(client_fd, "error unauthorized command\n");
+      return;
+    }
+
+    inject_parse_spawn_cancel(buffer, error, sizeof(error));
+    if (error[0] != '\0') {
+      dprintf(client_fd, "error %s\n", error);
+      return;
+    }
+
+    inject_cancel_spawn();
     inject_send_reply(client_fd, "ok\n");
     return;
   }
@@ -493,6 +665,11 @@ inject_finalize(void)
   if (inject_socket_path[0] != '\0') {
     unlink(inject_socket_path);
     inject_socket_path[0] = '\0';
+  }
+
+  if (inject_bus) {
+    sd_bus_unref(inject_bus);
+    inject_bus = NULL;
   }
 }
 
@@ -719,15 +896,18 @@ inject_request_eis_fd(const char *socket_path, const char *session_id,
     return -1;
   }
 
-  if (session_id && session_id[0] != '\0' && name && name[0] != '\0') {
-    if (snprintf(command, sizeof(command), "eis-open %s %u %s\n", session_id,
-                 capabilities, name) >= (int)sizeof(command)) {
-      fprintf(stderr, "hevel: EIS request command too long\n");
-      close(socket_fd);
-      return -1;
-    }
-  } else {
-    snprintf(command, sizeof(command), "eis-open\n");
+  if (!session_id || session_id[0] == '\0' || !name || name[0] == '\0') {
+    fprintf(stderr,
+            "hevel: EIS requests must identify an approved session and name\n");
+    close(socket_fd);
+    return -1;
+  }
+
+  if (snprintf(command, sizeof(command), "eis-open %s %u %s\n", session_id,
+               capabilities, name) >= (int)sizeof(command)) {
+    fprintf(stderr, "hevel: EIS request command too long\n");
+    close(socket_fd);
+    return -1;
   }
 
   if (inject_send_reply(socket_fd, command) < 0) {
@@ -781,6 +961,9 @@ inject_open_eis_fd(const char *display_name, const char *session_id,
                             ? display_name
                             : getenv("WAYLAND_DISPLAY");
 
+  if (!session_id || session_id[0] == '\0' || !name || name[0] == '\0')
+    return -EINVAL;
+
   if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
     fprintf(stderr,
             "hevel: cannot resolve injection socket path for EIS handoff\n");
@@ -814,6 +997,50 @@ inject_close_eis_session(const char *display_name, const char *session_id)
   }
 
   return inject_send_command(socket_path, command) == 0 ? 0 : -1;
+}
+
+int
+inject_prepare_approval_window(const char *display_name, const char *app_id,
+                               uint32_t width, uint32_t height)
+{
+  char socket_path[256];
+  char command[256];
+  const char *display = display_name && display_name[0] != '\0'
+                            ? display_name
+                            : getenv("WAYLAND_DISPLAY");
+
+  if (!app_id || strcmp(app_id, select_term_app_id) != 0) return -EINVAL;
+
+  if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path for approval window\n");
+    return -1;
+  }
+
+  if (snprintf(command, sizeof(command), "spawn-prepare %u %u\n", width,
+               height) >= (int)sizeof(command)) {
+    fprintf(stderr, "hevel: spawn prepare command too long\n");
+    return -1;
+  }
+
+  return inject_send_command(socket_path, command) == 0 ? 0 : -1;
+}
+
+int
+inject_cancel_prepared_spawn(const char *display_name)
+{
+  char socket_path[256];
+  const char *display = display_name && display_name[0] != '\0'
+                            ? display_name
+                            : getenv("WAYLAND_DISPLAY");
+
+  if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path for spawn rollback\n");
+    return -1;
+  }
+
+  return inject_send_command(socket_path, "spawn-cancel\n") == 0 ? 0 : -1;
 }
 
 static int

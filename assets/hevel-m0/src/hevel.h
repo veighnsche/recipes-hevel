@@ -146,9 +146,17 @@ struct hevel_eis_client {
 enum hevel_rd_session_state {
   HEVEL_RD_CREATED,
   HEVEL_RD_SELECTED,
+  HEVEL_RD_PENDING_APPROVAL,
   HEVEL_RD_STARTED,
   HEVEL_RD_CONNECTED,
   HEVEL_RD_CLOSED,
+};
+
+enum hevel_rd_approval_state {
+  HEVEL_RD_APPROVAL_UNKNOWN,
+  HEVEL_RD_APPROVAL_PENDING,
+  HEVEL_RD_APPROVAL_ALLOWED,
+  HEVEL_RD_APPROVAL_DENIED,
 };
 
 struct hevel_portal_request {
@@ -166,9 +174,12 @@ struct hevel_rd_session {
   char app_id[128];
   char parent_window[256];
   uint32_t selected_device_types;
+  enum hevel_rd_approval_state approval_state;
   bool approved;
   bool eis_fd_issued;
+  bool prompt_visible;
   enum hevel_rd_session_state state;
+  pid_t prompt_pid;
   struct sd_bus_slot *slot;
 };
 
@@ -204,12 +215,17 @@ int eis_open_client_fd(const char *session_id, uint32_t capabilities,
 int eis_close_session(const char *session_id);
 int eis_cli_main(int argc, char **argv);
 
+int approve_ui_main(int argc, char **argv);
+
 int inject_initialize(const char *display_name);
 void inject_finalize(void);
 int inject_cli_main(int argc, char **argv);
 int inject_open_eis_fd(const char *display_name, const char *session_id,
                        uint32_t capabilities, const char *name);
 int inject_close_eis_session(const char *display_name, const char *session_id);
+int inject_prepare_approval_window(const char *display_name, const char *app_id,
+                                   uint32_t width, uint32_t height);
+int inject_cancel_prepared_spawn(const char *display_name);
 
 extern const int timerms;
 

@@ -15,6 +15,7 @@ bool focus_center = FOCUS_CENTER;
 #include "zoom.c"
 #include "eis.c"
 #include "inject.c"
+#include "approve.c"
 #include "inputcapture.c"
 #include "remotedesktop.c"
 #include "portal.c"
@@ -128,9 +129,11 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "--eis") == 0) return eis_cli_main(argc - 2, argv + 2);
     if (strcmp(argv[1], "--inject") == 0)
       return inject_cli_main(argc - 2, argv + 2);
+    if (strcmp(argv[1], "--approve-ui") == 0)
+      return approve_ui_main(argc - 2, argv + 2);
     fprintf(stderr,
             "usage: %s [--portal-service | --inject <command> ... | --eis "
-            "<command> ...]\n",
+            "<command> ... | --approve-ui <app-id> <devices>]\n",
             argv[0]);
     return 2;
   }

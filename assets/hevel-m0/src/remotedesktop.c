@@ -1,6 +1,7 @@
 #include "hevel.h"
 
 #include <errno.h>
+#include <sys/wait.h>
 
 #include <systemd/sd-bus.h>
 
@@ -13,6 +14,11 @@
 #define HEVEL_RD_DEVICE_POINTER 2U
 #define HEVEL_RD_AVAILABLE_DEVICE_TYPES                                          \
   (HEVEL_RD_DEVICE_KEYBOARD | HEVEL_RD_DEVICE_POINTER)
+#define HEVEL_RD_APPROVAL_WIDTH 720U
+#define HEVEL_RD_APPROVAL_HEIGHT 220U
+#define HEVEL_RD_APPROVAL_TITLE "hevel approval"
+#define HEVEL_RD_APPROVAL_TERMINAL "/usr/local/bin/st-wl"
+#define HEVEL_RD_APPROVAL_HELPER "/usr/local/bin/hevel"
 
 static const char *remotedesktop_request_interface =
     "org.freedesktop.impl.portal.Request";
@@ -32,6 +38,7 @@ static int remotedesktop_property_session_version(sd_bus *bus, const char *path,
                                                   void *userdata,
                                                   sd_bus_error *ret_error);
 static void remotedesktop_destroy_request(struct hevel_portal_request *request);
+static void remotedesktop_stop_prompt(struct hevel_rd_session *session);
 
 static const sd_bus_vtable remotedesktop_request_vtable[] = {
     SD_BUS_VTABLE_START(0),
@@ -58,6 +65,8 @@ remotedesktop_state_name(enum hevel_rd_session_state state)
       return "created";
     case HEVEL_RD_SELECTED:
       return "selected";
+    case HEVEL_RD_PENDING_APPROVAL:
+      return "pending-approval";
     case HEVEL_RD_STARTED:
       return "started";
     case HEVEL_RD_CONNECTED:
@@ -174,6 +183,17 @@ remotedesktop_reply_rejected(sd_bus_message *m, const char *context,
   remotedesktop_log(context, NULL, detail);
   return remotedesktop_send_response(m, HEVEL_REMOTEDESKTOP_RESPONSE_OTHER,
                                      NULL, UINT32_MAX);
+}
+
+static int
+remotedesktop_destroy_request_and_reject(sd_bus_message *m,
+                                         struct hevel_portal_request *request,
+                                         const char *context,
+                                         const char *detail)
+{
+  int r = remotedesktop_reply_rejected(m, context, detail);
+  remotedesktop_destroy_request(request);
+  return r;
 }
 
 static int
@@ -301,6 +321,7 @@ remotedesktop_destroy_session(struct hevel_rd_session *session, bool emit_closed
 
   session->state = HEVEL_RD_CLOSED;
   remotedesktop_log("closing session", session->session_handle, "");
+  remotedesktop_stop_prompt(session);
 
   if (session->eis_fd_issued && session->session_id[0] != '\0' &&
       inject_close_eis_session(NULL, session->session_id) < 0)
@@ -386,6 +407,7 @@ remotedesktop_new_session(const char *session_handle, const char *app_id,
   snprintf(session->session_handle, sizeof(session->session_handle), "%s",
            session_handle);
   snprintf(session->app_id, sizeof(session->app_id), "%s", app_id ? app_id : "");
+  session->approval_state = HEVEL_RD_APPROVAL_UNKNOWN;
   session->state = HEVEL_RD_CREATED;
 
   r = remotedesktop_generate_session_id(session->session_id,
@@ -473,6 +495,150 @@ remotedesktop_map_eis_capabilities(uint32_t device_types)
   return capabilities;
 }
 
+static void
+remotedesktop_stop_prompt(struct hevel_rd_session *session)
+{
+  int status;
+
+  if (!session) return;
+
+  session->prompt_visible = false;
+  if (session->prompt_pid <= 0) {
+    session->prompt_pid = 0;
+    return;
+  }
+
+  if (kill(session->prompt_pid, SIGTERM) < 0 && errno != ESRCH)
+    perror("hevel: kill approval prompt");
+
+  while (waitpid(session->prompt_pid, &status, 0) < 0) {
+    if (errno == EINTR) continue;
+    if (errno != ECHILD) perror("hevel: waitpid approval prompt");
+    break;
+  }
+
+  session->prompt_pid = 0;
+}
+
+static int
+remotedesktop_format_devices(uint32_t types, char *buffer, size_t buffer_size)
+{
+  const bool have_keyboard = (types & HEVEL_RD_DEVICE_KEYBOARD) != 0;
+  const bool have_pointer = (types & HEVEL_RD_DEVICE_POINTER) != 0;
+  int written;
+
+  if (have_keyboard && have_pointer)
+    written = snprintf(buffer, buffer_size, "keyboard, pointer");
+  else if (have_keyboard)
+    written = snprintf(buffer, buffer_size, "keyboard");
+  else if (have_pointer)
+    written = snprintf(buffer, buffer_size, "pointer");
+  else
+    written = snprintf(buffer, buffer_size, "none");
+
+  return (written < 0 || (size_t)written >= buffer_size) ? -ENAMETOOLONG : 0;
+}
+
+static int
+remotedesktop_read_approval_decision(int fd, bool *approved)
+{
+  char decision[32];
+  size_t used = 0;
+
+  while (used < sizeof(decision) - 1) {
+    ssize_t amount = read(fd, decision + used, sizeof(decision) - 1 - used);
+
+    if (amount < 0) {
+      if (errno == EINTR) continue;
+      return -errno;
+    }
+    if (amount == 0) break;
+
+    used += (size_t)amount;
+    if (memchr(decision, '\n', used)) break;
+  }
+
+  while (used > 0 &&
+         (decision[used - 1] == '\n' || decision[used - 1] == '\r' ||
+          decision[used - 1] == ' ' || decision[used - 1] == '\t'))
+    --used;
+  decision[used] = '\0';
+
+  if (strcmp(decision, "allow") == 0) {
+    *approved = true;
+    return 0;
+  }
+  if (strcmp(decision, "deny") == 0) {
+    *approved = false;
+    return 0;
+  }
+
+  return used == 0 ? -ECANCELED : -EPROTO;
+}
+
+static int
+remotedesktop_prompt_for_approval(struct hevel_rd_session *session,
+                                  bool *approved)
+{
+  char devices[64];
+  char decision_fd[32];
+  const char *app_id =
+      session->app_id[0] != '\0' ? session->app_id : "(unknown)";
+  int pipefd[2];
+  pid_t pid;
+  bool spawn_prepared = false;
+  int r;
+
+  r = remotedesktop_format_devices(session->selected_device_types, devices,
+                                   sizeof(devices));
+  if (r < 0) return r;
+
+  if (pipe(pipefd) < 0) return -errno;
+
+  r = inject_prepare_approval_window(NULL, select_term_app_id,
+                                     HEVEL_RD_APPROVAL_WIDTH,
+                                     HEVEL_RD_APPROVAL_HEIGHT);
+  if (r < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return -EIO;
+  }
+  spawn_prepared = true;
+
+  pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    if (spawn_prepared) inject_cancel_prepared_spawn(NULL);
+    return -errno;
+  }
+
+  if (pid == 0) {
+    close(pipefd[0]);
+
+    if (snprintf(decision_fd, sizeof(decision_fd), "%d", pipefd[1]) >=
+        (int)sizeof(decision_fd))
+      _exit(127);
+    if (setenv("HEVEL_APPROVE_FD", decision_fd, 1) < 0) _exit(127);
+
+    execl(HEVEL_RD_APPROVAL_TERMINAL, term, term_flag, select_term_app_id, "-T",
+          HEVEL_RD_APPROVAL_TITLE, "-e", HEVEL_RD_APPROVAL_HELPER,
+          "--approve-ui", app_id, devices, NULL);
+    _exit(127);
+  }
+
+  close(pipefd[1]);
+  session->prompt_pid = pid;
+  session->prompt_visible = true;
+
+  r = remotedesktop_read_approval_decision(pipefd[0], approved);
+  close(pipefd[0]);
+  remotedesktop_stop_prompt(session);
+  if (spawn_prepared && inject_cancel_prepared_spawn(NULL) < 0)
+    fprintf(stderr, "hevel: failed to roll back prepared approval spawn\n");
+  return r;
+}
+
 static int
 remotedesktop_method_close_request(sd_bus_message *m, void *userdata,
                                    sd_bus_error *ret_error)
@@ -533,17 +699,21 @@ remotedesktop_method_create_session(sd_bus_message *m, void *userdata,
 
   r = remotedesktop_new_session(session_handle, app_id, &session);
   if (r == -EEXIST)
-    return remotedesktop_reply_rejected(m, "rejecting duplicate session",
-                                        session_handle);
+    return remotedesktop_destroy_request_and_reject(
+        m, request, "rejecting duplicate session", session_handle);
   if (r == -EBUSY)
-    return remotedesktop_reply_rejected(m, "rejecting second active session",
-                                        session_handle);
-  if (r < 0)
+    return remotedesktop_destroy_request_and_reject(
+        m, request, "rejecting second active session", session_handle);
+  if (r < 0) {
+    remotedesktop_destroy_request(request);
     return sd_bus_error_set_const(ret_error, remotedesktop_portal_error,
                                   "cannot export session object");
+  }
 
   remotedesktop_log("created session", session_handle, "");
-  return remotedesktop_reply_session_created(m, session);
+  r = remotedesktop_reply_session_created(m, session);
+  remotedesktop_destroy_request(request);
+  return r;
 }
 
 static int
@@ -582,24 +752,36 @@ remotedesktop_method_select_devices(sd_bus_message *m, void *userdata,
                                   "cannot export request object");
 
   r = remotedesktop_require_session(m, session_handle, app_id, &session);
-  if (r != 0) return r;
+  if (r != 0) {
+    remotedesktop_destroy_request(request);
+    return r;
+  }
 
   selected = types & HEVEL_RD_AVAILABLE_DEVICE_TYPES;
   if (selected == 0)
-    return remotedesktop_reply_rejected(m, "rejecting unsupported device mask",
-                                        session_handle);
+    return remotedesktop_destroy_request_and_reject(
+        m, request, "rejecting unsupported device mask", session_handle);
 
   if (session->state == HEVEL_RD_SELECTED &&
       session->selected_device_types == selected)
-    return remotedesktop_reply_devices(m, selected);
+  {
+    r = remotedesktop_reply_devices(m, selected);
+    remotedesktop_destroy_request(request);
+    return r;
+  }
 
   r = remotedesktop_require_lifecycle(m, session, HEVEL_RD_CREATED,
                                       "SelectDevices");
-  if (r != 0) return r;
+  if (r != 0) {
+    remotedesktop_destroy_request(request);
+    return r;
+  }
 
   session->selected_device_types = selected;
   remotedesktop_transition(session, HEVEL_RD_SELECTED);
-  return remotedesktop_reply_devices(m, selected);
+  r = remotedesktop_reply_devices(m, selected);
+  remotedesktop_destroy_request(request);
+  return r;
 }
 
 static int
@@ -614,6 +796,7 @@ remotedesktop_method_start(sd_bus_message *m, void *userdata,
   struct hevel_rd_session *session = NULL;
   uint32_t persist_mode = 0;
   bool have_persist_mode = false;
+  bool approved = false;
   int r;
 
   (void)userdata;
@@ -640,19 +823,48 @@ remotedesktop_method_start(sd_bus_message *m, void *userdata,
                                   "cannot export request object");
 
   r = remotedesktop_require_session(m, session_handle, app_id, &session);
-  if (r != 0) return r;
+  if (r != 0) {
+    remotedesktop_destroy_request(request);
+    return r;
+  }
 
   r = remotedesktop_require_lifecycle(m, session, HEVEL_RD_SELECTED, "Start");
-  if (r != 0) return r;
+  if (r != 0) {
+    remotedesktop_destroy_request(request);
+    return r;
+  }
   if (session->selected_device_types == 0)
-    return remotedesktop_reply_rejected(m, "rejecting Start without devices",
-                                        session_handle);
+    return remotedesktop_destroy_request_and_reject(
+        m, request, "rejecting Start without devices", session_handle);
 
   snprintf(session->parent_window, sizeof(session->parent_window), "%s",
            parent_window ? parent_window : "");
+  session->approved = false;
+  session->approval_state = HEVEL_RD_APPROVAL_PENDING;
+  remotedesktop_transition(session, HEVEL_RD_PENDING_APPROVAL);
+
+  r = remotedesktop_prompt_for_approval(session, &approved);
+  if (r < 0) {
+    session->approval_state = HEVEL_RD_APPROVAL_DENIED;
+    r = remotedesktop_reply_rejected(m, "rejecting Start after approval failure",
+                                     session_handle);
+    remotedesktop_destroy_session(session, true);
+    return r;
+  }
+  if (!approved) {
+    session->approval_state = HEVEL_RD_APPROVAL_DENIED;
+    r = remotedesktop_reply_rejected(m, "rejecting Start after approval denial",
+                                     session_handle);
+    remotedesktop_destroy_session(session, true);
+    return r;
+  }
+
   session->approved = true;
+  session->approval_state = HEVEL_RD_APPROVAL_ALLOWED;
   remotedesktop_transition(session, HEVEL_RD_STARTED);
-  return remotedesktop_reply_devices(m, session->selected_device_types);
+  r = remotedesktop_reply_devices(m, session->selected_device_types);
+  remotedesktop_destroy_request(request);
+  return r;
 }
 
 static int
@@ -686,6 +898,13 @@ remotedesktop_method_connect_to_eis(sd_bus_message *m, void *userdata,
   if (session->eis_fd_issued)
     return sd_bus_error_set_const(ret_error, remotedesktop_portal_error,
                                   "RemoteDesktop EIS fd already issued");
+  if (session->state == HEVEL_RD_PENDING_APPROVAL ||
+      session->approval_state == HEVEL_RD_APPROVAL_PENDING)
+    return sd_bus_error_set_const(ret_error, remotedesktop_portal_error,
+                                  "RemoteDesktop session is pending approval");
+  if (session->approval_state == HEVEL_RD_APPROVAL_DENIED)
+    return sd_bus_error_set_const(ret_error, remotedesktop_portal_error,
+                                  "RemoteDesktop session was denied");
   if (session->state != HEVEL_RD_STARTED)
     return sd_bus_error_set_const(ret_error, remotedesktop_portal_error,
                                   "RemoteDesktop session is not started");
