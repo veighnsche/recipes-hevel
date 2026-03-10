@@ -119,6 +119,10 @@ struct eis_device;
 struct eis_seat;
 struct sd_bus;
 struct sd_bus_slot;
+struct sd_bus_message;
+struct sd_event;
+struct sd_event_source;
+struct hevel_rd_pending_start;
 
 struct hevel_eis_request {
   struct wl_list link;
@@ -181,12 +185,27 @@ struct hevel_rd_session {
   enum hevel_rd_session_state state;
   pid_t prompt_pid;
   struct sd_bus_slot *slot;
+  struct hevel_rd_pending_start *pending_start;
+};
+
+struct hevel_rd_pending_start {
+  struct hevel_rd_session *session;
+  struct hevel_portal_request *request;
+  struct sd_bus_message *message;
+  int decision_fd;
+  pid_t prompt_pid;
+  struct sd_event_source *decision_source;
+  struct sd_event_source *timeout_source;
+  struct sd_event_source *prompt_source;
+  bool completed;
 };
 
 struct portal_state {
   struct sd_bus *bus;
+  struct sd_event *event;
   struct wl_list requests;
   struct wl_list remotedesktop_sessions;
+  struct hevel_rd_pending_start *pending_start;
   uint32_t next_session_id;
   bool available;
 };

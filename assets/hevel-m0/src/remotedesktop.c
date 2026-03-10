@@ -1,9 +1,11 @@
 #include "hevel.h"
 
 #include <errno.h>
+#include <sys/epoll.h>
 #include <sys/wait.h>
 
 #include <systemd/sd-bus.h>
+#include <systemd/sd-event.h>
 
 #define HEVEL_REMOTEDESKTOP_RESPONSE_SUCCESS 0U
 #define HEVEL_REMOTEDESKTOP_RESPONSE_OTHER 2U
@@ -19,6 +21,7 @@
 #define HEVEL_RD_APPROVAL_TITLE "hevel approval"
 #define HEVEL_RD_APPROVAL_TERMINAL "/usr/local/bin/st-wl"
 #define HEVEL_RD_APPROVAL_HELPER "/usr/local/bin/hevel"
+#define HEVEL_RD_APPROVAL_TIMEOUT_USEC (30ULL * 1000000ULL)
 
 static const char *remotedesktop_request_interface =
     "org.freedesktop.impl.portal.Request";
@@ -37,8 +40,34 @@ static int remotedesktop_property_session_version(sd_bus *bus, const char *path,
                                                   sd_bus_message *reply,
                                                   void *userdata,
                                                   sd_bus_error *ret_error);
+static struct hevel_rd_pending_start *
+remotedesktop_find_pending_start_for_request(
+    const struct hevel_portal_request *request);
+static struct hevel_rd_pending_start *
+remotedesktop_find_pending_start_for_session(
+    const struct hevel_rd_session *session);
 static void remotedesktop_destroy_request(struct hevel_portal_request *request);
 static void remotedesktop_stop_prompt(struct hevel_rd_session *session);
+static void
+remotedesktop_disarm_pending_start(struct hevel_rd_pending_start *pending,
+                                   bool stop_prompt);
+static void
+remotedesktop_free_pending_start(struct hevel_rd_pending_start *pending);
+static void remotedesktop_complete_pending_start(
+    struct hevel_rd_pending_start *pending, bool approved, const char *context,
+    const char *detail);
+static void remotedesktop_cancel_pending_start(
+    struct hevel_rd_pending_start *pending, const char *context,
+    const char *detail);
+static int remotedesktop_decision_ready(sd_event_source *source, int fd,
+                                        uint32_t revents, void *userdata);
+static int remotedesktop_prompt_exited(sd_event_source *source,
+                                       const siginfo_t *info, void *userdata);
+static int remotedesktop_approval_timeout(sd_event_source *source,
+                                          uint64_t usec, void *userdata);
+static int remotedesktop_begin_approval(struct hevel_portal_request *request,
+                                        struct hevel_rd_session *session,
+                                        sd_bus_message *message);
 
 static const sd_bus_vtable remotedesktop_request_vtable[] = {
     SD_BUS_VTABLE_START(0),
@@ -286,10 +315,29 @@ remotedesktop_find_active_session(void)
   return NULL;
 }
 
+static struct hevel_rd_pending_start *
+remotedesktop_find_pending_start_for_request(
+    const struct hevel_portal_request *request)
+{
+  if (!request || !portal.pending_start) return NULL;
+  return portal.pending_start->request == request ? portal.pending_start : NULL;
+}
+
+static struct hevel_rd_pending_start *
+remotedesktop_find_pending_start_for_session(
+    const struct hevel_rd_session *session)
+{
+  if (!session || !portal.pending_start) return NULL;
+  return portal.pending_start->session == session ? portal.pending_start : NULL;
+}
+
 static void
 remotedesktop_destroy_request(struct hevel_portal_request *request)
 {
   if (!request) return;
+
+  if (portal.pending_start && portal.pending_start->request == request)
+    portal.pending_start->request = NULL;
 
   wl_list_remove(&request->link);
   wl_list_init(&request->link);
@@ -318,6 +366,12 @@ static void
 remotedesktop_destroy_session(struct hevel_rd_session *session, bool emit_closed)
 {
   if (!session) return;
+
+  if (session->pending_start) {
+    remotedesktop_disarm_pending_start(session->pending_start, true);
+    remotedesktop_free_pending_start(session->pending_start);
+    session->pending_start = NULL;
+  }
 
   session->state = HEVEL_RD_CLOSED;
   remotedesktop_log("closing session", session->session_handle, "");
@@ -576,18 +630,199 @@ remotedesktop_read_approval_decision(int fd, bool *approved)
   return used == 0 ? -ECANCELED : -EPROTO;
 }
 
-static int
-remotedesktop_prompt_for_approval(struct hevel_rd_session *session,
-                                  bool *approved)
+static void
+remotedesktop_disarm_pending_start(struct hevel_rd_pending_start *pending,
+                                   bool stop_prompt)
 {
+  if (!pending) return;
+
+  if (pending->decision_source) {
+    sd_event_source_unref(pending->decision_source);
+    pending->decision_source = NULL;
+  }
+  if (pending->timeout_source) {
+    sd_event_source_unref(pending->timeout_source);
+    pending->timeout_source = NULL;
+  }
+  if (pending->prompt_source) {
+    sd_event_source_unref(pending->prompt_source);
+    pending->prompt_source = NULL;
+  }
+  if (pending->decision_fd >= 0) {
+    close(pending->decision_fd);
+    pending->decision_fd = -1;
+  }
+
+  if (portal.pending_start == pending) portal.pending_start = NULL;
+  if (pending->session && pending->session->pending_start == pending)
+    pending->session->pending_start = NULL;
+
+  if (stop_prompt && pending->session) {
+    remotedesktop_stop_prompt(pending->session);
+    if (inject_cancel_prepared_spawn(NULL) < 0)
+      fprintf(stderr, "hevel: failed to roll back prepared approval spawn\n");
+  }
+}
+
+static void
+remotedesktop_free_pending_start(struct hevel_rd_pending_start *pending)
+{
+  if (!pending) return;
+  if (pending->message) {
+    sd_bus_message_unref(pending->message);
+    pending->message = NULL;
+  }
+  free(pending);
+}
+
+static void
+remotedesktop_complete_pending_start(struct hevel_rd_pending_start *pending,
+                                     bool approved, const char *context,
+                                     const char *detail)
+{
+  struct hevel_rd_session *session;
+  struct hevel_portal_request *request;
+  sd_bus_message *message;
+  int r = 0;
+
+  if (!pending || pending->completed) return;
+
+  pending->completed = true;
+  session = pending->session;
+  request = pending->request;
+  message = pending->message ? sd_bus_message_ref(pending->message) : NULL;
+
+  remotedesktop_disarm_pending_start(pending, true);
+
+  if (approved && session) {
+    session->approved = true;
+    session->approval_state = HEVEL_RD_APPROVAL_ALLOWED;
+    remotedesktop_transition(session, HEVEL_RD_STARTED);
+    if (message)
+      r = remotedesktop_reply_devices(message, session->selected_device_types);
+    if (request) remotedesktop_destroy_request(request);
+  } else {
+    if (session) {
+      session->approved = false;
+      session->approval_state = HEVEL_RD_APPROVAL_DENIED;
+    }
+    if (message)
+      r = remotedesktop_reply_rejected(message,
+                                       context ? context : "rejecting Start",
+                                       detail ? detail : "");
+    else
+      remotedesktop_log(context ? context : "rejecting Start", NULL,
+                        detail ? detail : "");
+    if (session)
+      remotedesktop_destroy_session(session, true);
+    else if (request)
+      remotedesktop_destroy_request(request);
+  }
+
+  if (r < 0)
+    fprintf(stderr, "hevel: failed to finalize deferred Start reply: %s\n",
+            strerror(-r));
+  if (message) sd_bus_message_unref(message);
+  remotedesktop_free_pending_start(pending);
+}
+
+static void
+remotedesktop_cancel_pending_start(struct hevel_rd_pending_start *pending,
+                                   const char *context, const char *detail)
+{
+  remotedesktop_complete_pending_start(pending, false, context, detail);
+}
+
+static int
+remotedesktop_decision_ready(sd_event_source *source, int fd, uint32_t revents,
+                             void *userdata)
+{
+  struct hevel_rd_pending_start *pending = userdata;
+  bool approved = false;
+  int r;
+
+  (void)source;
+
+  if (!pending || pending->completed) return 0;
+  if ((revents & (EPOLLIN | EPOLLHUP | EPOLLERR)) == 0) return 0;
+
+  r = remotedesktop_read_approval_decision(fd, &approved);
+  if (r == 0)
+    remotedesktop_complete_pending_start(
+        pending, approved,
+        approved ? NULL : "rejecting Start after approval denial",
+        pending->session ? pending->session->session_handle : "");
+  else if (r == -ECANCELED)
+    remotedesktop_cancel_pending_start(
+        pending, "rejecting Start after approval pipe closed",
+        pending->session ? pending->session->session_handle : "");
+  else
+    remotedesktop_cancel_pending_start(
+        pending, "rejecting Start after approval failure",
+        pending->session ? pending->session->session_handle : "");
+
+  return 0;
+}
+
+static int
+remotedesktop_prompt_exited(sd_event_source *source, const siginfo_t *info,
+                            void *userdata)
+{
+  struct hevel_rd_pending_start *pending = userdata;
+  bool approved = false;
+  int r;
+
+  (void)source;
+  (void)info;
+
+  if (!pending || pending->completed || pending->decision_fd < 0) return 0;
+
+  r = remotedesktop_read_approval_decision(pending->decision_fd, &approved);
+  if (r == 0)
+    remotedesktop_complete_pending_start(
+        pending, approved,
+        approved ? NULL : "rejecting Start after approval denial",
+        pending->session ? pending->session->session_handle : "");
+  else
+    remotedesktop_cancel_pending_start(
+        pending, "rejecting Start after approval prompt exit",
+        pending->session ? pending->session->session_handle : "");
+
+  return 0;
+}
+
+static int
+remotedesktop_approval_timeout(sd_event_source *source, uint64_t usec,
+                               void *userdata)
+{
+  struct hevel_rd_pending_start *pending = userdata;
+
+  (void)source;
+  (void)usec;
+
+  if (!pending || pending->completed) return 0;
+
+  remotedesktop_cancel_pending_start(
+      pending, "rejecting Start after approval timeout",
+      pending->session ? pending->session->session_handle : "");
+  return 0;
+}
+
+static int
+remotedesktop_begin_approval(struct hevel_portal_request *request,
+                             struct hevel_rd_session *session,
+                             sd_bus_message *message)
+{
+  struct hevel_rd_pending_start *pending = NULL;
   char devices[64];
   char decision_fd[32];
   const char *app_id =
       session->app_id[0] != '\0' ? session->app_id : "(unknown)";
-  int pipefd[2];
+  int pipefd[2] = {-1, -1};
   pid_t pid;
-  bool spawn_prepared = false;
   int r;
+
+  if (!portal.event || portal.pending_start) return -EBUSY;
 
   r = remotedesktop_format_devices(session->selected_device_types, devices,
                                    sizeof(devices));
@@ -603,13 +838,12 @@ remotedesktop_prompt_for_approval(struct hevel_rd_session *session,
     close(pipefd[1]);
     return -EIO;
   }
-  spawn_prepared = true;
 
   pid = fork();
   if (pid < 0) {
     close(pipefd[0]);
     close(pipefd[1]);
-    if (spawn_prepared) inject_cancel_prepared_spawn(NULL);
+    inject_cancel_prepared_spawn(NULL);
     return -errno;
   }
 
@@ -628,14 +862,51 @@ remotedesktop_prompt_for_approval(struct hevel_rd_session *session,
   }
 
   close(pipefd[1]);
+  pipefd[1] = -1;
+
+  pending = calloc(1, sizeof(*pending));
+  if (!pending) {
+    close(pipefd[0]);
+    session->prompt_pid = pid;
+    session->prompt_visible = true;
+    remotedesktop_stop_prompt(session);
+    inject_cancel_prepared_spawn(NULL);
+    return -ENOMEM;
+  }
+
+  pending->session = session;
+  pending->request = request;
+  pending->message = sd_bus_message_ref(message);
+  pending->decision_fd = pipefd[0];
+  pending->prompt_pid = pid;
+
   session->prompt_pid = pid;
   session->prompt_visible = true;
+  session->pending_start = pending;
+  portal.pending_start = pending;
 
-  r = remotedesktop_read_approval_decision(pipefd[0], approved);
-  close(pipefd[0]);
-  remotedesktop_stop_prompt(session);
-  if (spawn_prepared && inject_cancel_prepared_spawn(NULL) < 0)
-    fprintf(stderr, "hevel: failed to roll back prepared approval spawn\n");
+  r = sd_event_add_io(portal.event, &pending->decision_source,
+                      pending->decision_fd, EPOLLIN | EPOLLHUP | EPOLLERR,
+                      remotedesktop_decision_ready, pending);
+  if (r < 0) goto fail;
+
+  r = sd_event_add_child(portal.event, &pending->prompt_source, pid, WEXITED,
+                         remotedesktop_prompt_exited, pending);
+  if (r < 0) goto fail;
+
+  r = sd_event_add_time_relative(
+      portal.event, &pending->timeout_source, CLOCK_MONOTONIC,
+      HEVEL_RD_APPROVAL_TIMEOUT_USEC, 0, remotedesktop_approval_timeout,
+      pending);
+  if (r < 0) goto fail;
+
+  return 0;
+
+fail:
+  fprintf(stderr, "hevel: failed to schedule async approval handling: %s\n",
+          strerror(-r));
+  remotedesktop_disarm_pending_start(pending, true);
+  remotedesktop_free_pending_start(pending);
   return r;
 }
 
@@ -644,11 +915,19 @@ remotedesktop_method_close_request(sd_bus_message *m, void *userdata,
                                    sd_bus_error *ret_error)
 {
   struct hevel_portal_request *request = userdata;
+  struct hevel_rd_pending_start *pending =
+      remotedesktop_find_pending_start_for_request(request);
   int r;
 
   (void)ret_error;
 
   r = sd_bus_reply_method_return(m, "");
+  if (pending) {
+    remotedesktop_cancel_pending_start(
+        pending, "rejecting Start after Request.Close",
+        request->session_handle);
+    return r;
+  }
   remotedesktop_destroy_request(request);
   return r;
 }
@@ -658,11 +937,19 @@ remotedesktop_method_close_session(sd_bus_message *m, void *userdata,
                                    sd_bus_error *ret_error)
 {
   struct hevel_rd_session *session = userdata;
+  struct hevel_rd_pending_start *pending =
+      remotedesktop_find_pending_start_for_session(session);
   int r;
 
   (void)ret_error;
 
   r = sd_bus_reply_method_return(m, "");
+  if (pending) {
+    remotedesktop_cancel_pending_start(
+        pending, "rejecting Start after Session.Close",
+        session->session_handle);
+    return r;
+  }
   remotedesktop_destroy_session(session, true);
   return r;
 }
@@ -796,7 +1083,6 @@ remotedesktop_method_start(sd_bus_message *m, void *userdata,
   struct hevel_rd_session *session = NULL;
   uint32_t persist_mode = 0;
   bool have_persist_mode = false;
-  bool approved = false;
   int r;
 
   (void)userdata;
@@ -843,7 +1129,7 @@ remotedesktop_method_start(sd_bus_message *m, void *userdata,
   session->approval_state = HEVEL_RD_APPROVAL_PENDING;
   remotedesktop_transition(session, HEVEL_RD_PENDING_APPROVAL);
 
-  r = remotedesktop_prompt_for_approval(session, &approved);
+  r = remotedesktop_begin_approval(request, session, m);
   if (r < 0) {
     session->approval_state = HEVEL_RD_APPROVAL_DENIED;
     r = remotedesktop_reply_rejected(m, "rejecting Start after approval failure",
@@ -851,20 +1137,8 @@ remotedesktop_method_start(sd_bus_message *m, void *userdata,
     remotedesktop_destroy_session(session, true);
     return r;
   }
-  if (!approved) {
-    session->approval_state = HEVEL_RD_APPROVAL_DENIED;
-    r = remotedesktop_reply_rejected(m, "rejecting Start after approval denial",
-                                     session_handle);
-    remotedesktop_destroy_session(session, true);
-    return r;
-  }
 
-  session->approved = true;
-  session->approval_state = HEVEL_RD_APPROVAL_ALLOWED;
-  remotedesktop_transition(session, HEVEL_RD_STARTED);
-  r = remotedesktop_reply_devices(m, session->selected_device_types);
-  remotedesktop_destroy_request(request);
-  return r;
+  return 1;
 }
 
 static int
@@ -991,6 +1265,12 @@ void
 remotedesktop_finalize(void)
 {
   if (!portal.remotedesktop_sessions.next || !portal.requests.next) return;
+
+  if (portal.pending_start) {
+    remotedesktop_disarm_pending_start(portal.pending_start, true);
+    remotedesktop_free_pending_start(portal.pending_start);
+    portal.pending_start = NULL;
+  }
 
   while (!wl_list_empty(&portal.remotedesktop_sessions)) {
     struct hevel_rd_session *session =
