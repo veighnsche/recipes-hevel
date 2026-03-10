@@ -93,9 +93,12 @@ main(int argc, char **argv)
 
   if (argc > 1) {
     if (strcmp(argv[1], "--portal-service") == 0) return portal_service_main();
+    if (strcmp(argv[1], "--eis") == 0) return eis_cli_main(argc - 2, argv + 2);
     if (strcmp(argv[1], "--inject") == 0)
       return inject_cli_main(argc - 2, argv + 2);
-    fprintf(stderr, "usage: %s [--portal-service | --inject <command> ...]\n",
+    fprintf(stderr,
+            "usage: %s [--portal-service | --inject <command> ... | --eis "
+            "<command> ...]\n",
             argv[0]);
     return 2;
   }
@@ -143,12 +146,15 @@ main(int argc, char **argv)
 
   if (inject_initialize(sock) < 0)
     fprintf(stderr, "hevel: continuing without local injection hook\n");
+  if (eis_initialize() < 0)
+    fprintf(stderr, "hevel: continuing without compositor EIS support\n");
 
   signal(SIGTERM, sig);
   signal(SIGINT, sig);
 
   wl_display_run(compositor.display);
 
+  eis_finalize();
   inject_finalize();
   swc_finalize();
   wl_display_destroy(compositor.display);

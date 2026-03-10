@@ -2,7 +2,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <libei.h>
 #include <limits.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -100,6 +102,60 @@ inject_send_reply(int fd, const char *reply)
   }
 
   return 0;
+}
+
+static int
+inject_send_fd(int socket_fd, int send_fd, const char *reply)
+{
+  struct msghdr msg = {0};
+  struct iovec iov = {.iov_base = (void *)reply, .iov_len = strlen(reply)};
+  char control[CMSG_SPACE(sizeof(send_fd))];
+  struct cmsghdr *cmsg;
+  ssize_t written;
+
+  memset(control, 0, sizeof(control));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(send_fd));
+  memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(send_fd));
+  msg.msg_controllen = cmsg->cmsg_len;
+
+  do {
+    written = sendmsg(socket_fd, &msg, 0);
+  } while (written < 0 && errno == EINTR);
+
+  return written < 0 ? -1 : 0;
+}
+
+static int
+inject_connect_socket(const char *socket_path)
+{
+  struct sockaddr_un addr = {0};
+  int fd;
+
+  if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "hevel: injection socket path too long\n");
+    return -1;
+  }
+
+  fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+
+  addr.sun_family = AF_UNIX;
+  strcpy(addr.sun_path, socket_path);
+
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+
+  return fd;
 }
 
 static int
@@ -202,6 +258,23 @@ inject_handle_client(int client_fd)
   }
 
   buffer[amount] = '\0';
+  if (strncmp(buffer, "eis-open", 8) == 0 &&
+      (buffer[8] == '\0' || buffer[8] == '\n' || buffer[8] == ' ' ||
+       buffer[8] == '\t' || buffer[8] == '\r')) {
+    int eis_fd = eis_open_client_fd(NULL, 0, "hevel-debug");
+
+    if (eis_fd < 0) {
+      dprintf(client_fd, "error cannot open EIS client fd: %s\n",
+              strerror(-eis_fd));
+      return;
+    }
+
+    if (inject_send_fd(client_fd, eis_fd, "ok\n") < 0)
+      inject_send_reply(client_fd, "error cannot send fd\n");
+    close(eis_fd);
+    return;
+  }
+
   if (inject_execute_command(buffer, error, sizeof(error)) < 0) {
     dprintf(client_fd, "error %s\n", error);
     return;
@@ -351,28 +424,13 @@ inject_build_command(char *buffer, size_t buffer_size, int argc, char **argv)
 static int
 inject_send_command(const char *socket_path, const char *command)
 {
-  struct sockaddr_un addr = {0};
   char response[256] = {0};
   int fd;
   ssize_t amount;
 
-  if (strlen(socket_path) >= sizeof(addr.sun_path)) {
-    fprintf(stderr, "hevel: injection socket path too long\n");
-    return 1;
-  }
-
-  fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  fd = inject_connect_socket(socket_path);
   if (fd < 0) {
     perror("hevel: socket");
-    return 1;
-  }
-
-  addr.sun_family = AF_UNIX;
-  strcpy(addr.sun_path, socket_path);
-
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("hevel: connect");
-    close(fd);
     return 1;
   }
 
@@ -434,4 +492,426 @@ inject_cli_main(int argc, char **argv)
   }
 
   return inject_send_command(socket_path, command);
+}
+
+struct hevel_ei_client {
+  struct ei *ctx;
+  struct ei_seat *seat;
+  struct ei_device *keyboard;
+  struct ei_device *pointer;
+  struct ei_device *pointer_abs;
+  struct ei_device *button;
+  struct ei_device *scroll;
+  uint32_t sequence;
+  bool connected;
+  bool disconnected;
+  bool keyboard_ready;
+  bool pointer_ready;
+  bool pointer_abs_ready;
+  bool button_ready;
+  bool scroll_ready;
+};
+
+static void
+eis_cli_release_device(struct ei_device **device)
+{
+  if (!device || !*device) return;
+  *device = ei_device_unref(*device);
+}
+
+static void
+eis_cli_reset(struct hevel_ei_client *client)
+{
+  eis_cli_release_device(&client->keyboard);
+  eis_cli_release_device(&client->pointer);
+  eis_cli_release_device(&client->pointer_abs);
+  eis_cli_release_device(&client->button);
+  eis_cli_release_device(&client->scroll);
+
+  if (client->seat) client->seat = ei_seat_unref(client->seat);
+  if (client->ctx) {
+    ei_unref(client->ctx);
+    client->ctx = NULL;
+  }
+}
+
+static void
+eis_cli_track_device(struct hevel_ei_client *client, struct ei_device *device)
+{
+  if (!client->keyboard && ei_device_has_capability(device, EI_DEVICE_CAP_KEYBOARD))
+    client->keyboard = ei_device_ref(device);
+  if (!client->pointer && ei_device_has_capability(device, EI_DEVICE_CAP_POINTER))
+    client->pointer = ei_device_ref(device);
+  if (!client->pointer_abs &&
+      ei_device_has_capability(device, EI_DEVICE_CAP_POINTER_ABSOLUTE))
+    client->pointer_abs = ei_device_ref(device);
+  if (!client->button && ei_device_has_capability(device, EI_DEVICE_CAP_BUTTON))
+    client->button = ei_device_ref(device);
+  if (!client->scroll && ei_device_has_capability(device, EI_DEVICE_CAP_SCROLL))
+    client->scroll = ei_device_ref(device);
+}
+
+static void
+eis_cli_mark_ready(struct hevel_ei_client *client, struct ei_device *device,
+                   bool ready)
+{
+  if (client->keyboard == device) client->keyboard_ready = ready;
+  if (client->pointer == device) client->pointer_ready = ready;
+  if (client->pointer_abs == device) client->pointer_abs_ready = ready;
+  if (client->button == device) client->button_ready = ready;
+  if (client->scroll == device) client->scroll_ready = ready;
+}
+
+static void
+eis_cli_process_events(struct hevel_ei_client *client)
+{
+  struct ei_event *event;
+
+  while ((event = ei_get_event(client->ctx)) != NULL) {
+    switch (ei_event_get_type(event)) {
+      case EI_EVENT_CONNECT:
+        client->connected = true;
+        break;
+      case EI_EVENT_DISCONNECT:
+        client->disconnected = true;
+        break;
+      case EI_EVENT_SEAT_ADDED:
+        if (!client->seat) client->seat = ei_seat_ref(ei_event_get_seat(event));
+        if (client->seat)
+          ei_seat_bind_capabilities(
+              client->seat, EI_DEVICE_CAP_POINTER, EI_DEVICE_CAP_POINTER_ABSOLUTE,
+              EI_DEVICE_CAP_KEYBOARD, EI_DEVICE_CAP_BUTTON, EI_DEVICE_CAP_SCROLL,
+              NULL);
+        break;
+      case EI_EVENT_DEVICE_ADDED:
+        eis_cli_track_device(client, ei_event_get_device(event));
+        break;
+      case EI_EVENT_DEVICE_RESUMED: {
+        struct ei_device *device = ei_event_get_device(event);
+        ei_device_start_emulating(device, ++client->sequence);
+        eis_cli_mark_ready(client, device, true);
+        break;
+      }
+      case EI_EVENT_DEVICE_PAUSED:
+        eis_cli_mark_ready(client, ei_event_get_device(event), false);
+        break;
+      default:
+        break;
+    }
+
+    ei_event_unref(event);
+  }
+}
+
+static int
+eis_cli_request_fd(const char *socket_path)
+{
+  char reply[64] = {0};
+  struct msghdr msg = {0};
+  struct iovec iov = {.iov_base = reply, .iov_len = sizeof(reply) - 1};
+  char control[CMSG_SPACE(sizeof(int))];
+  struct cmsghdr *cmsg;
+  int fd = -1;
+  int socket_fd;
+  ssize_t amount;
+
+  socket_fd = inject_connect_socket(socket_path);
+  if (socket_fd < 0) {
+    perror("hevel: connect");
+    return -1;
+  }
+
+  if (inject_send_reply(socket_fd, "eis-open\n") < 0) {
+    perror("hevel: write");
+    close(socket_fd);
+    return -1;
+  }
+
+  memset(control, 0, sizeof(control));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  do {
+    amount = recvmsg(socket_fd, &msg, 0);
+  } while (amount < 0 && errno == EINTR);
+
+  if (amount < 0) {
+    perror("hevel: recvmsg");
+    close(socket_fd);
+    return -1;
+  }
+
+  reply[amount] = '\0';
+  if (strncmp(reply, "ok", 2) != 0) {
+    fprintf(stderr, "%s", reply[0] ? reply : "error no reply\n");
+    close(socket_fd);
+    return -1;
+  }
+
+  cmsg = CMSG_FIRSTHDR(&msg);
+  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+      cmsg->cmsg_len < CMSG_LEN(sizeof(int))) {
+    fprintf(stderr, "hevel: EIS fd reply did not include a file descriptor\n");
+    close(socket_fd);
+    return -1;
+  }
+
+  memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+  close(socket_fd);
+  return fd;
+}
+
+static int
+eis_cli_connect(struct hevel_ei_client *client, const char *socket_path)
+{
+  int fd = eis_cli_request_fd(socket_path);
+  int r;
+
+  if (fd < 0) return -1;
+
+  client->ctx = ei_new_sender(NULL);
+  if (!client->ctx) {
+    close(fd);
+    fprintf(stderr, "hevel: cannot create EI sender context\n");
+    return -1;
+  }
+
+  ei_configure_name(client->ctx, "hevel-cli");
+  r = ei_setup_backend_fd(client->ctx, fd);
+  if (r < 0) {
+    fprintf(stderr, "hevel: cannot connect EI sender: %s\n", strerror(-r));
+    eis_cli_reset(client);
+    return -1;
+  }
+
+  return 0;
+}
+
+static bool
+eis_cli_ready_for_command(const struct hevel_ei_client *client,
+                          const char *command)
+{
+  if (strcmp(command, "ping") == 0) return client->connected;
+  if (strcmp(command, "key") == 0) return client->keyboard_ready;
+  if (strcmp(command, "motion") == 0) return client->pointer_ready;
+  if (strcmp(command, "absolute") == 0) return client->pointer_abs_ready;
+  if (strcmp(command, "button") == 0) return client->button_ready;
+  if (strcmp(command, "axis") == 0) return client->scroll_ready;
+  return false;
+}
+
+static int
+eis_cli_wait_ready(struct hevel_ei_client *client, const char *command)
+{
+  struct pollfd pfd;
+  uint32_t start = inject_now_ms();
+
+  pfd.fd = ei_get_fd(client->ctx);
+  pfd.events = POLLIN;
+
+  while (!eis_cli_ready_for_command(client, command)) {
+    int timeout_ms = 3000 - (int)(inject_now_ms() - start);
+    int r;
+
+    if (client->disconnected) {
+      fprintf(stderr, "hevel: EI sender disconnected before %s became ready\n",
+              command);
+      return -1;
+    }
+    if (timeout_ms <= 0) {
+      fprintf(stderr, "hevel: timed out waiting for %s capability\n", command);
+      return -1;
+    }
+
+    r = poll(&pfd, 1, timeout_ms);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      perror("hevel: poll");
+      return -1;
+    }
+    if (r == 0) {
+      fprintf(stderr, "hevel: timed out waiting for EI events\n");
+      return -1;
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+      fprintf(stderr, "hevel: EI sender connection became unusable\n");
+      return -1;
+    }
+
+    ei_dispatch(client->ctx);
+    eis_cli_process_events(client);
+  }
+
+  return 0;
+}
+
+static void
+eis_cli_flush(struct hevel_ei_client *client, int timeout_ms)
+{
+  struct pollfd pfd;
+  uint32_t start = inject_now_ms();
+
+  pfd.fd = ei_get_fd(client->ctx);
+  pfd.events = POLLIN | POLLOUT;
+
+  for (;;) {
+    int remaining = timeout_ms - (int)(inject_now_ms() - start);
+    int r;
+
+    ei_dispatch(client->ctx);
+    eis_cli_process_events(client);
+
+    if (remaining <= 0) return;
+
+    r = poll(&pfd, 1, remaining > 20 ? 20 : remaining);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return;
+    }
+    if (r == 0) return;
+  }
+}
+
+static int
+eis_cli_send_command(struct hevel_ei_client *client, int argc, char **argv)
+{
+  uint32_t key, button, state, axis;
+  int32_t dx, dy, x, y, value, value120;
+
+  if (argc <= 0) return 2;
+
+  if (strcmp(argv[0], "ping") == 0) {
+    puts("ok");
+    return 0;
+  }
+
+  if (strcmp(argv[0], "key") == 0) {
+    if (argc != 3 || inject_parse_u32(argv[1], &key) < 0 ||
+        inject_parse_u32(argv[2], &state) < 0) {
+      fprintf(stderr, "usage: hevel --eis key <evdev-key> <state>\n");
+      return 2;
+    }
+    ei_device_keyboard_key(client->keyboard, key, state != 0);
+    ei_device_frame(client->keyboard, ei_now(client->ctx));
+    eis_cli_flush(client, 100);
+    puts("sent");
+    return 0;
+  }
+
+  if (strcmp(argv[0], "motion") == 0) {
+    if (argc != 3 || inject_parse_i32(argv[1], &dx) < 0 ||
+        inject_parse_i32(argv[2], &dy) < 0) {
+      fprintf(stderr, "usage: hevel --eis motion <dx> <dy>\n");
+      return 2;
+    }
+    ei_device_pointer_motion(client->pointer, (double)dx, (double)dy);
+    ei_device_frame(client->pointer, ei_now(client->ctx));
+    eis_cli_flush(client, 100);
+    puts("sent");
+    return 0;
+  }
+
+  if (strcmp(argv[0], "absolute") == 0) {
+    if (argc != 3 || inject_parse_i32(argv[1], &x) < 0 ||
+        inject_parse_i32(argv[2], &y) < 0) {
+      fprintf(stderr, "usage: hevel --eis absolute <x> <y>\n");
+      return 2;
+    }
+    ei_device_pointer_motion_absolute(client->pointer_abs, (double)x, (double)y);
+    ei_device_frame(client->pointer_abs, ei_now(client->ctx));
+    eis_cli_flush(client, 100);
+    puts("sent");
+    return 0;
+  }
+
+  if (strcmp(argv[0], "button") == 0) {
+    if (argc != 3 || inject_parse_u32(argv[1], &button) < 0 ||
+        inject_parse_u32(argv[2], &state) < 0) {
+      fprintf(stderr, "usage: hevel --eis button <button> <state>\n");
+      return 2;
+    }
+    ei_device_button_button(client->button, button, state != 0);
+    ei_device_frame(client->button, ei_now(client->ctx));
+    eis_cli_flush(client, 100);
+    puts("sent");
+    return 0;
+  }
+
+  if (strcmp(argv[0], "axis") == 0) {
+    if (argc != 4 || inject_parse_u32(argv[1], &axis) < 0 ||
+        inject_parse_i32(argv[2], &value) < 0 ||
+        inject_parse_i32(argv[3], &value120) < 0) {
+      fprintf(stderr, "usage: hevel --eis axis <axis> <value> <value120>\n");
+      return 2;
+    }
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+      if (value != 0) ei_device_scroll_delta(client->scroll, 0.0, (double)value);
+      if (value120 != 0) ei_device_scroll_discrete(client->scroll, 0, value120);
+    } else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+      if (value != 0) ei_device_scroll_delta(client->scroll, (double)value, 0.0);
+      if (value120 != 0) ei_device_scroll_discrete(client->scroll, value120, 0);
+    } else {
+      fprintf(stderr, "hevel: unsupported axis %u\n", axis);
+      return 2;
+    }
+    ei_device_frame(client->scroll, ei_now(client->ctx));
+    eis_cli_flush(client, 100);
+    puts("sent");
+    return 0;
+  }
+
+  fprintf(stderr,
+          "usage: hevel --eis [--socket PATH] <ping|key|motion|absolute|button|axis> ...\n");
+  return 2;
+}
+
+int
+eis_cli_main(int argc, char **argv)
+{
+  struct hevel_ei_client client = {0};
+  char socket_path[256];
+  const char *display = getenv("WAYLAND_DISPLAY");
+  int rc;
+
+  if (argc <= 0) {
+    fprintf(stderr,
+            "usage: hevel --eis [--socket PATH] "
+            "<ping|key|motion|absolute|button|axis> ...\n");
+    return 2;
+  }
+
+  if (argc >= 3 && strcmp(argv[0], "--socket") == 0) {
+    if (snprintf(socket_path, sizeof(socket_path), "%s", argv[1]) >=
+        (int)sizeof(socket_path)) {
+      fprintf(stderr, "hevel: socket path too long\n");
+      return 2;
+    }
+    argv += 2;
+    argc -= 2;
+  } else if (inject_resolve_socket_path(socket_path, sizeof(socket_path),
+                                        display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path; set WAYLAND_DISPLAY "
+            "and XDG_RUNTIME_DIR or use --socket\n");
+    return 1;
+  }
+
+  if (eis_cli_connect(&client, socket_path) < 0) {
+    eis_cli_reset(&client);
+    return 1;
+  }
+
+  ei_dispatch(client.ctx);
+  eis_cli_process_events(&client);
+  if (eis_cli_wait_ready(&client, argv[0]) < 0) {
+    eis_cli_reset(&client);
+    return 1;
+  }
+  eis_cli_flush(&client, 100);
+
+  rc = eis_cli_send_command(&client, argc, argv);
+  eis_cli_reset(&client);
+  return rc;
 }

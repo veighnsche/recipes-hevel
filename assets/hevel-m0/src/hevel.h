@@ -114,6 +114,32 @@ struct sel_state {
 extern struct sel_state sel;
 
 struct eis;
+struct eis_client;
+struct eis_device;
+struct eis_seat;
+
+struct hevel_eis_request {
+  struct wl_list link;
+  uint32_t id;
+  uint32_t capabilities;
+  char session_id[128];
+  char name[64];
+};
+
+struct hevel_eis_client {
+  struct wl_list link;
+  struct eis_client *client;
+  struct hevel_eis_request *request;
+  struct eis_seat *seat;
+  struct eis_device *keyboard;
+  struct eis_device *pointer;
+  struct eis_device *pointer_abs;
+  int32_t absolute_origin_x;
+  int32_t absolute_origin_y;
+  bool keyboard_active;
+  bool pointer_active;
+  bool pointer_abs_active;
+};
 
 struct portal_state {
   bool available;
@@ -122,6 +148,11 @@ extern struct portal_state portal;
 
 struct eis_state {
   struct eis *ctx;
+  int fd;
+  struct wl_event_source *source;
+  struct wl_list requests;
+  struct wl_list clients;
+  uint32_t next_request_id;
   bool available;
 };
 extern struct eis_state eis_state;
@@ -132,6 +163,9 @@ int portal_service_main(void);
 
 int eis_initialize(void);
 void eis_finalize(void);
+int eis_open_client_fd(const char *session_id, uint32_t capabilities,
+                       const char *name);
+int eis_cli_main(int argc, char **argv);
 
 int inject_initialize(const char *display_name);
 void inject_finalize(void);
