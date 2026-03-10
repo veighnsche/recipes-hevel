@@ -413,6 +413,61 @@ inject_parse_spawn_cancel(char *buffer, char *error, size_t error_size)
 }
 
 static void
+inject_parse_inputcapture_zones(char *buffer, char *error, size_t error_size)
+{
+  char *argv[3] = {0};
+  char *save = NULL;
+  int argc = 0;
+
+  for (char *token = strtok_r(buffer, " \t\r\n", &save);
+       token && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       token = strtok_r(NULL, " \t\r\n", &save)) {
+    argv[argc++] = token;
+  }
+
+  if (argc != 1) {
+    snprintf(error, error_size, "usage: ic-zones");
+    return;
+  }
+
+  error[0] = '\0';
+}
+
+static uint32_t
+inject_count_inputcapture_zones(void)
+{
+  struct hevel_ic_zone *zone;
+  uint32_t count = 0;
+
+  wl_list_for_each(zone, &inputcapture.zones, link)
+  {
+    ++count;
+  }
+
+  return count;
+}
+
+static int
+inject_send_inputcapture_zones(int client_fd)
+{
+  struct hevel_ic_zone *zone;
+  uint32_t count = inject_count_inputcapture_zones();
+
+  if (dprintf(client_fd, "ok %u %u\n", inputcapture.zone_set_serial, count) < 0)
+    return -errno;
+
+  wl_list_for_each(zone, &inputcapture.zones, link)
+  {
+    if (dprintf(client_fd, "%u %d %d %u %u\n", zone->id, zone->geometry.x,
+                zone->geometry.y, zone->geometry.width,
+                zone->geometry.height) < 0)
+      return -errno;
+  }
+
+  return 0;
+}
+
+static void
 inject_handle_client(int client_fd)
 {
   char buffer[256];
@@ -525,6 +580,28 @@ inject_handle_client(int client_fd)
     }
 
     inject_send_reply(client_fd, "ok\n");
+    return;
+  }
+
+  if (strncmp(buffer, "ic-zones", 8) == 0 &&
+      (buffer[8] == '\0' || buffer[8] == '\n' || buffer[8] == ' ' ||
+       buffer[8] == '\t' || buffer[8] == '\r')) {
+    int r;
+
+    if (!inject_authorize_portal_peer(client_fd, "ic-zones")) {
+      inject_send_reply(client_fd, "error unauthorized command\n");
+      return;
+    }
+
+    inject_parse_inputcapture_zones(buffer, error, sizeof(error));
+    if (error[0] != '\0') {
+      dprintf(client_fd, "error %s\n", error);
+      return;
+    }
+
+    r = inject_send_inputcapture_zones(client_fd);
+    if (r < 0)
+      dprintf(client_fd, "error cannot send zone data: %s\n", strerror(-r));
     return;
   }
 
@@ -731,6 +808,151 @@ inject_send_command(const char *socket_path, const char *command)
 
   fprintf(stderr, "%s", response[0] ? response : "error no reply\n");
   return 1;
+}
+
+static int
+inject_read_reply_all(int fd, char **buffer_out)
+{
+  char *buffer = NULL;
+  size_t capacity = 1024;
+  size_t used = 0;
+
+  buffer = calloc(1, capacity);
+  if (!buffer) return -ENOMEM;
+
+  for (;;) {
+    ssize_t amount;
+
+    if (used + 1 >= capacity) {
+      char *resized;
+      capacity *= 2;
+      resized = realloc(buffer, capacity);
+      if (!resized) {
+        free(buffer);
+        return -ENOMEM;
+      }
+      buffer = resized;
+    }
+
+    amount = read(fd, buffer + used, capacity - used - 1);
+    if (amount < 0) {
+      if (errno == EINTR) continue;
+      free(buffer);
+      return -errno;
+    }
+    if (amount == 0) break;
+
+    used += (size_t)amount;
+  }
+
+  buffer[used] = '\0';
+  *buffer_out = buffer;
+  return 0;
+}
+
+static void
+inject_destroy_zone_list(struct wl_list *zones)
+{
+  struct hevel_ic_zone *zone, *tmp;
+
+  if (!zones || !zones->next) return;
+
+  wl_list_for_each_safe(zone, tmp, zones, link)
+  {
+    wl_list_remove(&zone->link);
+    wl_list_init(&zone->link);
+    free(zone);
+  }
+}
+
+int
+inject_fetch_inputcapture_zones(const char *display_name, struct wl_list *zones,
+                                uint32_t *zone_set_serial)
+{
+  char socket_path[256];
+  char *reply = NULL;
+  char *line = NULL;
+  char *save = NULL;
+  const char *display = display_name && display_name[0] != '\0'
+                            ? display_name
+                            : getenv("WAYLAND_DISPLAY");
+  uint32_t serial = 0;
+  uint32_t count = 0;
+  int socket_fd;
+  int r;
+
+  if (!zones || !zone_set_serial) return -EINVAL;
+
+  wl_list_init(zones);
+
+  if (inject_resolve_socket_path(socket_path, sizeof(socket_path), display) < 0) {
+    fprintf(stderr,
+            "hevel: cannot resolve injection socket path for InputCapture zones\n");
+    return -ENOENT;
+  }
+
+  socket_fd = inject_connect_socket(socket_path);
+  if (socket_fd < 0) {
+    perror("hevel: connect");
+    return -errno;
+  }
+
+  if (inject_send_reply(socket_fd, "ic-zones\n") < 0) {
+    r = -errno;
+    perror("hevel: write");
+    close(socket_fd);
+    return r;
+  }
+
+  r = inject_read_reply_all(socket_fd, &reply);
+  close(socket_fd);
+  if (r < 0) return r;
+
+  if (strncmp(reply, "error", 5) == 0) {
+    fprintf(stderr, "%s", reply[0] ? reply : "error no reply\n");
+    free(reply);
+    return -EIO;
+  }
+
+  line = strtok_r(reply, "\n", &save);
+  if (!line || sscanf(line, "ok %u %u", &serial, &count) != 2) {
+    free(reply);
+    return -EPROTO;
+  }
+
+  for (uint32_t i = 0; i < count; ++i) {
+    struct hevel_ic_zone *zone;
+
+    line = strtok_r(NULL, "\n", &save);
+    if (!line) {
+      inject_destroy_zone_list(zones);
+      free(reply);
+      return -EPROTO;
+    }
+
+    zone = calloc(1, sizeof(*zone));
+    if (!zone) {
+      inject_destroy_zone_list(zones);
+      free(reply);
+      return -ENOMEM;
+    }
+
+    wl_list_init(&zone->link);
+    if (sscanf(line, "%u %d %d %u %u", &zone->id, &zone->geometry.x,
+               &zone->geometry.y, &zone->geometry.width,
+               &zone->geometry.height) != 5) {
+      free(zone);
+      inject_destroy_zone_list(zones);
+      free(reply);
+      return -EPROTO;
+    }
+
+    wl_list_insert(zones->prev, &zone->link);
+  }
+
+  free(reply);
+  *zone_set_serial = serial;
+  return 0;
 }
 
 int

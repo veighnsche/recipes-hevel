@@ -221,11 +221,20 @@ struct hevel_ic_request {
 
 struct hevel_ic_session {
   struct wl_list link;
+  struct wl_list barriers;
   char session_handle[256];
+  char session_id[128];
   char app_id[128];
+  char parent_window[256];
+  uint32_t capabilities;
   enum hevel_ic_enable_state enable_state;
   enum hevel_ic_capture_state capture_state;
   uint32_t activation_id;
+  uint32_t barrier_zone_serial;
+  double release_cursor_x;
+  double release_cursor_y;
+  bool barriers_stale;
+  bool have_release_cursor;
   bool eis_fd_issued;
   struct sd_bus_slot *slot;
 };
@@ -252,11 +261,8 @@ struct inputcapture_state {
   struct wl_list requests;
   struct wl_list sessions;
   struct wl_list zones;
-  struct wl_list barriers;
-  struct hevel_ic_session *barrier_owner;
+  struct sd_event_source *zone_watch_source;
   uint32_t zone_set_serial;
-  uint32_t installed_barrier_zone_serial;
-  bool barriers_stale;
   bool initialized;
 };
 extern struct inputcapture_state inputcapture;
@@ -307,6 +313,8 @@ int inject_cli_main(int argc, char **argv);
 int inject_open_eis_fd(const char *display_name, const char *session_id,
                        uint32_t capabilities, const char *name);
 int inject_close_eis_session(const char *display_name, const char *session_id);
+int inject_fetch_inputcapture_zones(const char *display_name, struct wl_list *zones,
+                                    uint32_t *zone_set_serial);
 int inject_prepare_approval_window(const char *display_name, const char *app_id,
                                    uint32_t width, uint32_t height);
 int inject_cancel_prepared_spawn(const char *display_name);
