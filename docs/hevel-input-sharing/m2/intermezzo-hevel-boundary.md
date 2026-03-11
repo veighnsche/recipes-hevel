@@ -7,6 +7,9 @@ Objective:
 - turn the hevel-side InputCapture implementation into a stable subsystem
   boundary before touching `neuswc`, so Phase 3 starts from verified behavior,
   explicit ownership rules, and less incidental coupling
+- complete the dedicated large-file refactor program in
+  [intermezzo-large-file-refactor.md](intermezzo-large-file-refactor.md) so no
+  oversized overlay source file remains above `500` lines
 
 Why this intermezzo exists:
 
@@ -15,6 +18,8 @@ Why this intermezzo exists:
   domain logic, and compositor-bridge transport in ways that will make `M2P3`
   harder to reason about if left as-is
 - this is not a polish pass; it is the boundary-hardening step before SWC work
+- the oversized-file problem is structural, so it gets its own companion plan
+  instead of being treated as incidental cleanup
 
 #### Stage I.1: Prove the current runtime invariants
 
@@ -152,4 +157,5 @@ Acceptance criteria:
 - barrier semantics are correct before any SWC-side capture hooks are added
 - the hevel overlay boundary is simpler and clearer than the current
   Phase 2 landing state
-
+- the companion large-file refactor plan has been completed and no `.c` file in
+  `assets/hevel-overlay/src` exceeds `500` lines

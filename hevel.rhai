@@ -4,9 +4,9 @@ let overlay_dir = join_path(RECIPE_DIR, "assets/hevel-overlay");
 let ctx = #{
     bin_path: "/usr/local/bin/hevel",
     name: "hevel",
-    overlay_dir: overlay_dir,
+    overlay_dir: "/home/vince/.local/share/recipe/recipes/assets/hevel-overlay",
     repo_url: "https://git.sr.ht/~dlm/hevel",
-    src_dir: "/tmp/.tmpTzEYR9/hevel-f5f689cfe2d0f398ad227af1fba2d960cee000c6",
+    src_dir: "/tmp/.tmpk5YbaS/hevel-f5f689cfe2d0f398ad227af1fba2d960cee000c6",
     version: "f5f689cfe2d0f398ad227af1fba2d960cee000c6",
 };
 
@@ -14,7 +14,23 @@ fn apply_overlay(ctx) {
     let src_overlay = join_path(ctx.overlay_dir, "src");
 
     write_file(join_path(ctx.src_dir, "Makefile"), read_file(join_path(ctx.overlay_dir, "Makefile")));
-    for file in ["hevel.c", "hevel.h", "window.c", "eis.c", "inject.c", "approve.c", "portal.c", "inputcapture.c", "remotedesktop.c"] {
+    for file in [
+        "hevel.c",
+        "hevel.h",
+        "window.c",
+        "eis.c",
+        "inject.c",
+        "approve.c",
+        "portal.c",
+        "inputcapture.c",
+        "inputcapture.h",
+        "inputcapture-signals.c",
+        "inputcapture-barriers.c",
+        "inputcapture-session.c",
+        "inputcapture-zones.c",
+        "inputcapture-methods.c",
+        "remotedesktop.c",
+    ] {
         write_file(join_path(join_path(ctx.src_dir, "src"), file), read_file(join_path(src_overlay, file)));
     }
 

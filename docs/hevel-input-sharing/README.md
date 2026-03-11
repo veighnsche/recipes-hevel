@@ -41,6 +41,7 @@ smaller documents instead of one monolithic file.
 - [Phase 1: Model InputCapture State In `hevel`](m2/phase-1-inputcapture-state.md)
 - [Phase 2: Implement The InputCapture Backend Surface In `hevel`](m2/phase-2-inputcapture-backend-surface.md)
 - [Intermezzo: Architecturally Harden The `hevel`-Side InputCapture Boundary](m2/intermezzo-hevel-boundary.md)
+- [Intermezzo Companion: Large-file Refactor Program](m2/intermezzo-large-file-refactor.md)
 - [Phase 3: Add Barrier And Capture Hooks To `neuswc`](m2/phase-3-neuswc-barrier-and-capture-hooks.md)
 - [Phase 4: Wire Activation And Live Handoff Between `hevel` And `neuswc`](m2/phase-4-activation-and-handoff.md)
 - [Phase 5: Handle Cursor Re-entry And Continuity](m2/phase-5-cursor-reentry-and-continuity.md)

@@ -12,3 +12,7 @@ Milestone completion criteria:
   approved EIS client
 - `Release` returns control locally and applies the release cursor hint
 
+Refactor gate before `M2P3`:
+
+- [Intermezzo: Hevel Boundary](intermezzo-hevel-boundary.md)
+- [Intermezzo Companion: Large-file Refactor](intermezzo-large-file-refactor.md)

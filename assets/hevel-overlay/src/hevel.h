@@ -123,17 +123,6 @@ struct sd_bus_message;
 struct sd_event;
 struct sd_event_source;
 struct hevel_rd_pending_start;
-struct hevel_ic_session;
-
-enum hevel_ic_enable_state {
-  HEVEL_IC_DISABLED,
-  HEVEL_IC_ENABLED,
-};
-
-enum hevel_ic_capture_state {
-  HEVEL_IC_INACTIVE,
-  HEVEL_IC_ACTIVE,
-};
 
 struct hevel_eis_request {
   struct wl_list link;
@@ -210,62 +199,6 @@ struct hevel_rd_pending_start {
   struct sd_event_source *prompt_source;
   bool completed;
 };
-
-struct hevel_ic_request {
-  struct wl_list link;
-  char handle[256];
-  char session_handle[256];
-  char app_id[128];
-  struct sd_bus_slot *slot;
-};
-
-struct hevel_ic_session {
-  struct wl_list link;
-  struct wl_list barriers;
-  char session_handle[256];
-  char session_id[128];
-  char app_id[128];
-  char parent_window[256];
-  uint32_t capabilities;
-  enum hevel_ic_enable_state enable_state;
-  enum hevel_ic_capture_state capture_state;
-  uint32_t activation_id;
-  uint32_t barrier_zone_serial;
-  double release_cursor_x;
-  double release_cursor_y;
-  bool barriers_stale;
-  bool have_release_cursor;
-  bool eis_fd_issued;
-  struct sd_bus_slot *slot;
-};
-
-struct hevel_ic_zone {
-  struct wl_list link;
-  uint32_t id;
-  struct swc_rectangle geometry;
-};
-
-struct hevel_ic_barrier {
-  struct wl_list link;
-  uint32_t id;
-  uint32_t zone_id;
-  uint32_t zone_serial;
-  int32_t x1;
-  int32_t y1;
-  int32_t x2;
-  int32_t y2;
-  struct hevel_ic_session *owner;
-};
-
-struct inputcapture_state {
-  struct wl_list requests;
-  struct wl_list sessions;
-  struct wl_list zones;
-  struct sd_event_source *zone_watch_source;
-  uint32_t zone_set_serial;
-  bool initialized;
-};
-extern struct inputcapture_state inputcapture;
 
 struct portal_state {
   struct sd_bus *bus;

@@ -25,5 +25,6 @@ The current planning and refactor work should happen in the Milestone 2 docs:
 - [Phase 1: InputCapture State](docs/hevel-input-sharing/m2/phase-1-inputcapture-state.md)
 - [Phase 2: InputCapture Backend Surface](docs/hevel-input-sharing/m2/phase-2-inputcapture-backend-surface.md)
 - [Intermezzo: Hevel Boundary](docs/hevel-input-sharing/m2/intermezzo-hevel-boundary.md)
+- [Intermezzo Companion: Large-file Refactor](docs/hevel-input-sharing/m2/intermezzo-large-file-refactor.md)
 
 This legacy path is kept so older references do not break.

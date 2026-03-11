@@ -1,4 +1,5 @@
 #include "hevel.h"
+#include "inputcapture.h"
 
 #include <errno.h>
 #include <fcntl.h>
